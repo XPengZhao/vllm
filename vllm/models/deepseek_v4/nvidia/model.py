@@ -46,7 +46,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    MixtureOfExperts,
+    SupportsEagle3,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -918,6 +922,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention.attn_gemm_parallel_execute
@@ -1035,8 +1040,12 @@ class DeepseekV4Model(nn.Module):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
+        aux_hidden_states: list[torch.Tensor] = []
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1045,6 +1054,20 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            if layer_idx + 1 in self.aux_hidden_state_layers:
+                # DeepSeek V4 keeps the target stream in HC-expanded form
+                # [num_tokens, hc_mult, hidden_size] until hc_head collapses it.
+                # DFlash speculators for DeepSeek V4 are trained against this
+                # pre-hc stream, flattened to target_hidden_size
+                # (hc_mult * hidden_size, e.g. 16384 for DeepSeek-V4-Flash).
+                aux_hidden_states.append(
+                    mhc_post_tilelang(
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                    ).flatten(1)
+                )
         if layer is not None:
             hidden_states = mhc_post_tilelang(
                 hidden_states, residual, post_mix, res_mix
@@ -1066,6 +1089,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1292,7 +1317,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
+class DeepseekV4ForCausalLM(
+    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
+):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -1348,6 +1375,16 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.get_eagle3_default_aux_hidden_state_layers()
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def compute_logits(
         self,
