@@ -33,6 +33,8 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -1555,8 +1557,23 @@ class SpecDecodeBaseProposer:
                     kv_cache_spec=layer_kv_cache_spec,
                     kv_cache_group_id=gid,
                 )
+                builder_vllm_config = self.vllm_config
+                if (
+                    self.vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+                    and not isinstance(
+                        layer_kv_cache_spec,
+                        (MLAAttentionSpec, SlidingWindowMLASpec),
+                    )
+                ):
+                    builder_vllm_config = replace(
+                        self.vllm_config,
+                        cache_config=replace(
+                            self.vllm_config.cache_config,
+                            cache_dtype="fp8",
+                        ),
+                    )
                 attn_group.create_metadata_builders(
-                    self.vllm_config,
+                    builder_vllm_config,
                     self.device,
                     kernel_block_size=kernel_block_size,
                 )

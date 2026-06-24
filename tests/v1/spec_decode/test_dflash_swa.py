@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm.config import SpeculativeConfig
+from vllm.config import CacheConfig, SpeculativeConfig, VllmConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.qwen3_dflash import DFlashAttention
 from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
@@ -96,6 +96,23 @@ def _compute_dflash_hash(hf_config: SimpleNamespace) -> str:
     return config.compute_hash()
 
 
+def test_dflash_allows_deepseek_v4_target_model():
+    config = object.__new__(SpeculativeConfig)
+    config.tensor_parallel_size = None
+    config.num_speculative_tokens = 7
+    config.rejection_sample_method = "standard"
+    config.synthetic_acceptance_rates = None
+    config.synthetic_acceptance_length = None
+    config.draft_model_config = None
+    config.draft_parallel_config = None
+    config.method = "dflash"
+    config.target_model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="deepseek_v4")
+    )
+
+    assert SpeculativeConfig._verify_args(config) is config
+
+
 def test_dflash_compile_hash_uses_checkpoint_layer_id_semantics():
     dflash_hash = _compute_dflash_hash(
         SimpleNamespace(dflash_config={"target_layer_ids": [0, 2]})
@@ -109,6 +126,21 @@ def test_dflash_compile_hash_uses_checkpoint_layer_id_semantics():
 
     assert dflash_hash == shifted_aux_hash
     assert dflash_hash != different_hash
+
+
+def test_dflash_draft_config_maps_deepseek_mla_fp8_cache_to_standard_fp8():
+    proposer = object.__new__(DFlashProposer)
+    proposer.vllm_config = VllmConfig(cache_config=CacheConfig(cache_dtype="fp8_ds_mla"))
+    proposer.speculative_config = SimpleNamespace(
+        moe_backend=None,
+        attention_backend=None,
+    )
+
+    draft_config = DFlashProposer._create_draft_vllm_config(proposer)
+
+    assert draft_config.cache_config.cache_dtype == "fp8"
+    assert proposer.vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+    assert draft_config.attention_config.use_non_causal is True
 
 
 def test_dflash_swa_layers_use_full_kv_cache_spec(monkeypatch):

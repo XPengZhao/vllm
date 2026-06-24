@@ -146,7 +146,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    MLAAttentionSpec,
     MambaSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -6439,10 +6441,29 @@ class GPUModelRunner(
         """
         Create the metadata builders for all KV cache groups and attn groups.
         """
+        def _builder_vllm_config_for_attn_group(
+            attn_group: AttentionGroup,
+        ) -> VllmConfig:
+            if (
+                self.vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+                and not isinstance(
+                    attn_group.kv_cache_spec,
+                    (MLAAttentionSpec, SlidingWindowMLASpec),
+                )
+            ):
+                return replace(
+                    self.vllm_config,
+                    cache_config=replace(
+                        self.vllm_config.cache_config,
+                        cache_dtype="fp8",
+                    ),
+                )
+            return self.vllm_config
+
         for kv_cache_group_id in range(len(kv_cache_config.kv_cache_groups)):
             for attn_group in self.attn_groups[kv_cache_group_id]:
                 attn_group.create_metadata_builders(
-                    self.vllm_config,
+                    _builder_vllm_config_for_attn_group(attn_group),
                     self.device,
                     kernel_block_sizes[kv_cache_group_id]
                     if kv_cache_group_id < len(kernel_block_sizes)

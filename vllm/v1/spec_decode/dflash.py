@@ -109,8 +109,15 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
+        cache_config = base.cache_config
+        if cache_config.cache_dtype == "fp8_ds_mla":
+            # fp8_ds_mla is a DeepSeek MLA-specific target KV-cache layout.
+            # DFlash draft layers use normal attention kernels, so keep fp8
+            # quantization but use the standard fp8 cache layout for the draft.
+            cache_config = replace(cache_config, cache_dtype="fp8")
         return replace(
             base,
+            cache_config=cache_config,
             attention_config=replace(
                 base.attention_config,
                 use_non_causal=True,

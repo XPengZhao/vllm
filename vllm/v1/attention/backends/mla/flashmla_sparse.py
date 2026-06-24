@@ -281,11 +281,6 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         parallel_config = vllm_config.parallel_config
         self.device = device
 
-        # Classify single-token queries (plus num_speculative_tokens via
-        # supports_spec_as_decode=True) as decodes; longer queries go to
-        # prefill.
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
-
         sm_count = num_compute_units(device.index)
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
@@ -352,6 +347,21 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         self.is_deepseek_v4 = (
             hasattr(hf_config, "compress_ratios") and len(hf_config.compress_ratios) > 0
         )
+        if self.is_deepseek_v4:
+            # Match DeepseekV4 SWA/indexer split semantics. With DFlash
+            # parallel_drafting=True, the generic spec-as-decode rule would
+            # use 1 + 2N, but target verification query length is 1 + N.
+            num_speculative_tokens = (
+                vllm_config.speculative_config.num_speculative_tokens
+                if vllm_config.speculative_config
+                else 0
+            )
+            self.reorder_batch_threshold = 1 + num_speculative_tokens
+        else:
+            # Classify single-token queries (plus num_speculative_tokens via
+            # supports_spec_as_decode=True) as decodes; longer queries go to
+            # prefill.
+            self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self.compress_ratio = 1
         if self.is_deepseek_v4:
             assert hasattr(self.kv_cache_spec, "compress_ratio")

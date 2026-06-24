@@ -49,6 +49,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import SupportsEagle3
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -1240,6 +1241,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
@@ -1325,7 +1327,18 @@ class DeepseekV4Model(nn.Module):
         hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            if layer_idx in self.aux_hidden_state_layers:
+                # DeepSeek V4 keeps the target stream in HC-expanded form
+                # [num_tokens, hc_mult, hidden_size] until hc_head collapses it.
+                # DFlash DeepSeek speculators use the target layer input state,
+                # flattened to target_hidden_size (hc_mult * hidden_size, e.g.
+                # 16384 for DeepSeek-V4-Flash).
+                aux_hidden_states.append(hidden_states.flatten(1))
             hidden_states = layer(
                 hidden_states,
                 positions,
@@ -1345,6 +1358,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1525,7 +1540,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     )
 
 
-class DeepseekV4ForCausalLM(nn.Module):
+class DeepseekV4ForCausalLM(nn.Module, SupportsEagle3):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -1553,6 +1568,20 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # DFlash config conversion shifts target_layer_ids by +1 to match
+        # vLLM's generic post-layer hidden-state extraction convention.  For
+        # DeepSeek V4, the DFlash checkpoint is trained on MHC layer input
+        # states, so convert the runner-facing ids back to raw layer ids here.
+        self.model.aux_hidden_state_layers = tuple(i - 1 for i in layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.get_eagle3_default_aux_hidden_state_layers()
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def compute_logits(
         self,

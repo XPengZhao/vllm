@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -46,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -1201,6 +1203,59 @@ def test_project_kv_cache_groups_to_worker():
     proj_spec = projected[0].kv_cache_spec
     assert isinstance(proj_spec, UniformTypeKVCacheSpecs)
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
+
+
+def test_deepseek_v4_dflash_draft_full_attention_layers_get_kv_groups():
+    mla = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        cache_dtype_str="fp8_ds_mla",
+        model_version="deepseek_v4",
+    )
+    swa = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=256,
+        cache_dtype_str="fp8_ds_mla",
+        model_version="deepseek_v4",
+    )
+    draft = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    kv_cache_spec = {
+        "model.layers.0.self_attn": mla,
+        "model.layers.1.self_attn": swa,
+        "model.layers.43.self_attn.attn": draft,
+        "model.layers.44.self_attn.attn": draft,
+    }
+
+    vllm_config = SimpleNamespace(
+        scheduler_config=SchedulerConfig(),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+    )
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+    grouped_layer_names = {name for group in groups for name in group.layer_names}
+    assert grouped_layer_names == set(kv_cache_spec)
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config=vllm_config,
+        kv_cache_groups=groups,
+        available_memory=10
+        * sum(spec.page_size_bytes for spec in kv_cache_spec.values()),
+    )
+    tensor_layer_names = {
+        name for tensor in config.kv_cache_tensors for name in tensor.shared_by
+    }
+    assert tensor_layer_names == set(kv_cache_spec)
 
 
 def test_merge_kv_cache_spec():
