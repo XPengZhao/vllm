@@ -64,6 +64,10 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
     pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
     if config_dict.get("target_hidden_size") is not None:
         pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
+    elif (hc_mult := pre_trained_config.get("hc_mult")) is not None:
+        pre_trained_config["target_hidden_size"] = (
+            pre_trained_config["hidden_size"] * hc_mult
+        )
     for key in (
         "layer_types",
         "use_sliding_window",

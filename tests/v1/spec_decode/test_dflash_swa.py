@@ -89,6 +89,25 @@ def test_dflash_speculators_preserves_swa_config():
     assert hf_config["dflash_config"]["target_layer_ids"] == [0, 1, 2]
 
 
+def test_dflash_speculators_derives_hc_target_hidden_size():
+    hf_config = SpeculatorsConfig.extract_transformers_pre_trained_config(
+        {
+            "speculators_model_type": "dflash",
+            "transformer_layer_config": {
+                "num_hidden_layers": 5,
+                "hidden_size": 4096,
+                "hc_mult": 4,
+            },
+            "draft_vocab_size": 100,
+            "target_hidden_size": None,
+            "aux_hidden_state_layer_ids": [3, 13, 23, 32, 42],
+            "mask_token_id": 1,
+        }
+    )
+
+    assert hf_config["target_hidden_size"] == 16384
+
+
 def _compute_dflash_hash(hf_config: SimpleNamespace) -> str:
     config = object.__new__(SpeculativeConfig)
     config.method = "dflash"
@@ -165,6 +184,28 @@ def test_dflash_swa_layers_use_full_kv_cache_spec(monkeypatch):
     assert spec.block_size == sliding_spec.block_size
     assert spec.num_kv_heads == sliding_spec.num_kv_heads
     assert spec.head_size == sliding_spec.head_size
+    assert spec.sliding_window is None
+
+
+def test_dflash_swa_kv_spec_ignores_target_mla_config():
+    layer = object.__new__(DFlashAttention)
+    layer.sliding_window = 2048
+    layer.num_kv_heads = 1
+    layer.head_size = 8
+    layer.head_size_v = 8
+    layer.kv_cache_torch_dtype = torch.float16
+    layer.kv_cache_dtype = "fp8"
+
+    spec = DFlashAttention.get_kv_cache_spec(
+        layer,
+        SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16),
+            model_config=SimpleNamespace(use_mla=True),
+        ),
+    )
+
+    assert isinstance(spec, FullAttentionSpec)
+    assert spec.block_size == 16
     assert spec.sliding_window is None
 
 

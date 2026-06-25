@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    get_kv_quant_mode,
 )
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
@@ -85,6 +86,15 @@ class DFlashAttention(Attention):
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        if getattr(self, "sliding_window", None) is not None:
+            return FullAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            )
         spec = super().get_kv_cache_spec(vllm_config)
         if isinstance(spec, SlidingWindowSpec):
             return FullAttentionSpec(
