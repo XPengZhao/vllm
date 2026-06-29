@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -1328,22 +1329,53 @@ class DeepseekV4Model(nn.Module):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
         aux_hidden_states: list[torch.Tensor] = []
+        dflash_aux_capture = os.environ.get("VLLM_DSV4_DFLASH_AUX_CAPTURE", "raw")
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            if layer_idx in self.aux_hidden_state_layers:
-                # DeepSeek V4 keeps the target stream in HC-expanded form
-                # [num_tokens, hc_mult, hidden_size] until hc_head collapses it.
-                # DFlash DeepSeek speculators use the target layer input state,
-                # flattened to target_hidden_size (hc_mult * hidden_size, e.g.
-                # 16384 for DeepSeek-V4-Flash).
+            capture_aux = layer_idx in self.aux_hidden_state_layers
+            if capture_aux and dflash_aux_capture == "raw":
                 aux_hidden_states.append(hidden_states.flatten(1))
-            hidden_states = layer(
-                hidden_states,
-                positions,
-                input_ids,
-            )
+                hidden_states = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                )
+            elif capture_aux and dflash_aux_capture == "attn_hc_pre":
+                residual = hidden_states
+                x, post, comb = layer.hc_pre(
+                    hidden_states,
+                    layer.hc_attn_fn,
+                    layer.hc_attn_scale,
+                    layer.hc_attn_base,
+                )
+                aux_hidden_states.append(x.flatten(1))
+                x = layer.attn_norm(x)
+                x = layer.attn(positions, x, None)
+                hidden_states = layer.hc_post(x, residual, post, comb)
+
+                residual = hidden_states
+                x, post, comb = layer.hc_pre(
+                    hidden_states,
+                    layer.hc_ffn_fn,
+                    layer.hc_ffn_scale,
+                    layer.hc_ffn_base,
+                )
+                x = layer.ffn_norm(x)
+                x = layer.ffn(x, input_ids)
+                hidden_states = layer.hc_post(x, residual, post, comb)
+            else:
+                hidden_states = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                )
+                if capture_aux:
+                    # DeepSeek V4 keeps the stream HC-expanded
+                    # [num_tokens, hc_mult, hidden_size] until hc_head, so
+                    # flatten the post-layer MHC state for the drafter fc.
+                    aux_hidden_states.append(hidden_states.flatten(1))
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
@@ -1570,10 +1602,10 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsEagle3):
         return self.model.embed_input_ids(input_ids)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        # DFlash config conversion shifts target_layer_ids by +1 to match
-        # vLLM's generic post-layer hidden-state extraction convention.  For
-        # DeepSeek V4, the DFlash checkpoint is trained on MHC layer input
-        # states, so convert the runner-facing ids back to raw layer ids here.
+        # vLLM's EAGLE/DFlash config conversion shifts target_layer_ids by +1
+        # to follow the generic post-layer hidden-state convention. DeepSeek V4
+        # DFlash uses HC-expanded target layer input states, so convert the
+        # runner-facing ids back to raw layer ids here.
         self.model.aux_hidden_state_layers = tuple(i - 1 for i in layers)
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:

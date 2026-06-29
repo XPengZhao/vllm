@@ -1128,3 +1128,23 @@ def test_set_inputs_first_pass_dflash():
 
     # Verify hidden states (stored by reference, not copied)
     assert proposer._dflash_hidden_states is target_hidden_states
+
+
+def test_greedy_sample_uses_full_logits_when_vocab_remapped():
+    proposer = object.__new__(DFlashProposer)
+    proposer.use_local_argmax_reduction = True
+    proposer.model = mock.MagicMock()
+    proposer.model.draft_id_to_target_id = torch.tensor([10, 20])
+    proposer.model.compute_logits.return_value = torch.full(
+        (1, 129280), float("-inf")
+    )
+    proposer.model.compute_logits.return_value[0, 50000] = 1.0
+
+    result = DFlashProposer._greedy_sample(
+        proposer,
+        torch.zeros(1, 4),
+    )
+
+    assert result.tolist() == [50000]
+    proposer.model.compute_logits.assert_called_once()
+    proposer.model.get_top_tokens.assert_not_called()

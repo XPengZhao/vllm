@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -16,6 +17,14 @@ from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
 
 logger = init_logger(__name__)
+
+
+def _dflash_trace_enabled() -> bool:
+    return os.environ.get("VLLM_DFLASH_TRACE") == "1"
+
+
+def _dflash_context_only_attn_enabled() -> bool:
+    return os.environ.get("VLLM_DFLASH_CONTEXT_ONLY_ATTN") == "1"
 
 
 class DFlashProposer(SpecDecodeBaseProposer):
@@ -85,6 +94,52 @@ class DFlashProposer(SpecDecodeBaseProposer):
         kernel_block_sizes: list[int] | None = None,
     ) -> None:
         super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        if (
+            (
+                os.environ.get("VLLM_DFLASH_KV_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and not getattr(self, "_logged_dflash_kv_backend_debug", False)
+        ):
+            self._logged_dflash_kv_backend_debug = True
+            attn_by_name = {
+                attn.layer_name: attn
+                for attn in getattr(self.model.model, "_attn_layers", [])
+            }
+            debug_rows = []
+            for attn_group in self.draft_attn_groups:
+                kv_cache_spec = attn_group.kv_cache_spec
+                for layer_name in attn_group.layer_names[:2]:
+                    attn = attn_by_name.get(layer_name)
+                    debug_rows.append(
+                        {
+                            "layer": layer_name,
+                            "gid": attn_group.kv_cache_group_id,
+                            "attn_kv_cache_dtype": (
+                                getattr(attn, "kv_cache_dtype", None)
+                                if attn is not None
+                                else None
+                            ),
+                            "attn_kv_torch_dtype": (
+                                str(getattr(attn, "kv_cache_torch_dtype", None))
+                                if attn is not None
+                                else None
+                            ),
+                            "spec_type": type(kv_cache_spec).__name__,
+                            "spec_dtype": str(getattr(kv_cache_spec, "dtype", None)),
+                            "spec_quant_mode": str(
+                                getattr(kv_cache_spec, "kv_quant_mode", None)
+                            ),
+                            "spec_block_size": getattr(
+                                kv_cache_spec, "block_size", None
+                            ),
+                        }
+                    )
+            logger.info(
+                "DFlash KV backend debug: target_cache_dtype=%s, draft_groups=%s.",
+                self.vllm_config.cache_config.cache_dtype,
+                debug_rows,
+            )
         self._draft_block_size_by_gid.clear()
         for attn_group in self.draft_attn_groups:
             gid = attn_group.kv_cache_group_id
@@ -110,11 +165,28 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
         cache_config = base.cache_config
-        if cache_config.cache_dtype == "fp8_ds_mla":
-            # fp8_ds_mla is a DeepSeek MLA-specific target KV-cache layout.
-            # DFlash draft layers use normal attention kernels, so keep fp8
-            # quantization but use the standard fp8 cache layout for the draft.
-            cache_config = replace(cache_config, cache_dtype="fp8")
+        if cache_config.cache_dtype != "auto":
+            # DFlash draft K/V is produced by projecting target auxiliary hidden
+            # states into the drafter's own attention layers.  Target KV cache
+            # dtype settings (notably DeepSeek fp8/fp8_ds_mla) should not be
+            # inherited by the drafter unless the DFlash checkpoint provides
+            # matching KV scales.  Use the model dtype for the draft KV cache.
+            cache_config = replace(cache_config, cache_dtype="auto")
+        if (
+            (
+                os.environ.get("VLLM_DFLASH_KV_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and not getattr(self, "_logged_dflash_draft_config_debug", False)
+        ):
+            self._logged_dflash_draft_config_debug = True
+            logger.info(
+                "DFlash draft config debug: target_cache_dtype=%s, "
+                "draft_cache_dtype=%s, draft_model_dtype=%s.",
+                self.vllm_config.cache_config.cache_dtype,
+                cache_config.cache_dtype,
+                self.draft_model_config.dtype,
+            )
         return replace(
             base,
             cache_config=cache_config,
@@ -228,6 +300,27 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         # Context preprocessing does not run in a CUDA graph.
         self._dflash_hidden_states = target_hidden_states
+        draft_next_token_ids = next_token_ids
+        if (
+            hasattr(self.model, "target_ids_to_draft_ids")
+            and getattr(self.model, "uses_draft_vocab_for_input_ids", False)
+        ):
+            draft_next_token_ids = self.model.target_ids_to_draft_ids(next_token_ids)
+        if (
+            (
+                os.environ.get("VLLM_DFLASH_LOGIT_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and not getattr(self, "_logged_dflash_input_id_debug", False)
+        ):
+            self._logged_dflash_input_id_debug = True
+            logger.info(
+                "DFlash trace input ids: target_next_token_ids=%s, "
+                "draft_next_token_ids=%s, uses_draft_vocab_for_input_ids=%s.",
+                next_token_ids[:8].detach().cpu().tolist(),
+                draft_next_token_ids[:8].detach().cpu().tolist(),
+                getattr(self.model, "uses_draft_vocab_for_input_ids", None),
+            )
 
         token_indices_to_sample = torch.empty(
             batch_size * self.num_speculative_tokens,
@@ -252,7 +345,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             block_table = self._get_dflash_block_table(kv_cache_gid, cad)
             copy_and_expand_dflash_inputs_kernel[grid](
                 # Inputs
-                next_token_ids_ptr=next_token_ids,
+                next_token_ids_ptr=draft_next_token_ids,
                 target_positions_ptr=target_positions,
                 # Outputs
                 out_input_ids_ptr=self.input_ids,
@@ -293,9 +386,44 @@ class DFlashProposer(SpecDecodeBaseProposer):
         if has_num_rejected:
             effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
 
+        if (
+            (
+                os.environ.get("VLLM_DFLASH_POSITION_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and not getattr(self, "_logged_dflash_position_debug", False)
+        ):
+            self._logged_dflash_position_debug = True
+            context_slot_mapping = self._slot_mapping_buffers_by_gid[
+                primary_kv_cache_gid
+            ][0][:num_context]
+            logger.info(
+                "DFlash trace position: batch_size=%d, num_context=%d, "
+                "num_query_per_req=%d, query_start_loc=%s, "
+                "target_positions_tail=%s, query_positions=%s, input_ids=%s, "
+                "context_slot_mapping_tail=%s, query_slot_mapping=%s, "
+                "effective_seq_lens=%s, new_seq_lens=%s.",
+                batch_size,
+                num_context,
+                num_query_per_req,
+                cad.query_start_loc.detach().cpu().tolist(),
+                target_positions[-min(num_context, 16) :].detach().cpu().tolist(),
+                self.positions[:num_query_total].detach().cpu().tolist(),
+                self.input_ids[:num_query_total].detach().cpu().tolist(),
+                context_slot_mapping[
+                    -min(context_slot_mapping.shape[0], 16) :
+                ].detach().cpu().tolist(),
+                query_slot_mapping.detach().cpu().tolist(),
+                effective_seq_lens.detach().cpu().tolist(),
+                (effective_seq_lens + num_query_per_req).detach().cpu().tolist(),
+            )
+
+        context_only_attn = _dflash_context_only_attn_enabled()
         new_cad = CommonAttentionMetadata(
             query_start_loc=new_query_start_loc,
-            seq_lens=effective_seq_lens + num_query_per_req,
+            seq_lens=effective_seq_lens
+            if context_only_attn
+            else effective_seq_lens + num_query_per_req,
             query_start_loc_cpu=(
                 torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone()
                 * num_query_per_req
@@ -305,7 +433,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
             num_reqs=cad.num_reqs,
             num_actual_tokens=num_query_total,
             max_query_len=num_query_per_req,
-            max_seq_len=cad.max_seq_len + num_query_per_req,
+            max_seq_len=cad.max_seq_len
+            if context_only_attn
+            else cad.max_seq_len + num_query_per_req,
             block_table_tensor=self._get_dflash_block_table(primary_kv_cache_gid, cad),
             slot_mapping=query_slot_mapping,
             causal=False,  # Non-causal attention is required for DFlash
@@ -428,6 +558,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
             # forward context. Keep the non-causal group metadata for
             # group-level spec decode checks, and specialize only the SWA
             # layers that need a causal sliding-window mask.
+            if (
+                os.environ.get("VLLM_DFLASH_SWA_NON_CAUSAL") == "1"
+                or _dflash_context_only_attn_enabled()
+            ):
+                continue
             causal_layers = sliding_layer_names & set(attn_group.layer_names)
             if causal_layers:
                 causal_attn_metadata = (
@@ -441,15 +576,45 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         for layer_name, attn_metadata in per_layer.items():
             if layer_name in sliding_layer_names:
-                assert getattr(attn_metadata, "causal", None) is True, (
-                    f"Attention metadata for sliding layer {layer_name} does not have"
-                    " causal support, which is required for DFlash SWA."
-                )
+                if (
+                    os.environ.get("VLLM_DFLASH_SWA_NON_CAUSAL") != "1"
+                    and not _dflash_context_only_attn_enabled()
+                ):
+                    assert getattr(attn_metadata, "causal", None) is True, (
+                        f"Attention metadata for sliding layer {layer_name} does not "
+                        "have causal support, which is required for DFlash SWA."
+                    )
                 continue
             assert getattr(attn_metadata, "causal", None) is False, (
                 f"Attention metadata for layer {layer_name} does not have"
                 " non-causal support, which is required for DFlash."
                 " Consider using a different attention backend, such as FlashAttention."
+            )
+        if (
+            (
+                os.environ.get("VLLM_DFLASH_ATTN_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and not getattr(self, "_logged_dflash_attn_debug", False)
+        ):
+            self._logged_dflash_attn_debug = True
+            sample = []
+            for layer_name, attn_metadata in list(per_layer.items())[:8]:
+                sample.append(
+                    {
+                        "layer": layer_name,
+                        "metadata": type(attn_metadata).__name__,
+                        "causal": getattr(attn_metadata, "causal", None),
+                        "sliding": layer_name in sliding_layer_names,
+                    }
+                )
+            logger.info(
+                "DFlash trace attention metadata: sliding_layers=%d, "
+                "swa_non_causal_env=%s, context_only_attn_env=%s, sample=%s.",
+                len(sliding_layer_names),
+                os.environ.get("VLLM_DFLASH_SWA_NON_CAUSAL"),
+                os.environ.get("VLLM_DFLASH_CONTEXT_ONLY_ATTN"),
+                sample,
             )
         return per_group, per_layer
 

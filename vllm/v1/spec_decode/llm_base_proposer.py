@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -56,6 +57,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _dflash_trace_enabled() -> bool:
+    return os.environ.get("VLLM_DFLASH_TRACE") == "1"
 
 
 class SpecDecodeBaseProposer:
@@ -393,9 +398,39 @@ class SpecDecodeBaseProposer:
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
-        if self.use_local_argmax_reduction:
+        has_vocab_remap = (
+            hasattr(self.model, "draft_id_to_target_id")
+            and self.model.draft_id_to_target_id is not None
+        )
+        if self.use_local_argmax_reduction and not has_vocab_remap:
             return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+        logits = self.model.compute_logits(hidden_states)
+        token_ids = logits.argmax(dim=-1)
+        if (
+            has_vocab_remap
+            and (
+                os.environ.get("VLLM_DFLASH_LOGIT_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and not getattr(self, "_logged_dflash_logit_debug", False)
+        ):
+            self._logged_dflash_logit_debug = True
+            finite_counts = torch.isfinite(logits).sum(dim=-1)
+            mapping = self.model.draft_id_to_target_id
+            logger.info(
+                "DFlash trace remapped logits: logits_shape=%s, "
+                "finite_logits_per_row=%s, sampled_token_ids=%s, "
+                "sampled_token_id_min=%d, sampled_token_id_max=%d, "
+                "draft_to_target_offset_min=%d, draft_to_target_offset_max=%d.",
+                tuple(logits.shape),
+                finite_counts[:8].detach().cpu().tolist(),
+                token_ids[:8].detach().cpu().tolist(),
+                int(token_ids.min().item()),
+                int(token_ids.max().item()),
+                int(mapping.min().item()),
+                int(mapping.max().item()),
+            )
+        return token_ids
 
     def propose(
         self,
@@ -466,7 +501,21 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            if (
+                os.environ.get("VLLM_DFLASH_LAYER_DEBUG") == "1"
+                or os.environ.get("VLLM_DFLASH_ATTN_VALUE_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            ):
+                setattr(self.model, "_dflash_in_real_propose", True)
+            try:
+                ret_hidden_states = self.model(**model_kwargs)
+            finally:
+                if (
+                    os.environ.get("VLLM_DFLASH_LAYER_DEBUG") == "1"
+                    or os.environ.get("VLLM_DFLASH_ATTN_VALUE_DEBUG") == "1"
+                    or _dflash_trace_enabled()
+                ):
+                    setattr(self.model, "_dflash_in_real_propose", False)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -584,7 +633,21 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                if (
+                    os.environ.get("VLLM_DFLASH_LAYER_DEBUG") == "1"
+                    or os.environ.get("VLLM_DFLASH_ATTN_VALUE_DEBUG") == "1"
+                    or _dflash_trace_enabled()
+                ):
+                    setattr(self.model, "_dflash_in_real_propose", True)
+                try:
+                    ret_hidden_states = self.model(**model_kwargs)
+                finally:
+                    if (
+                        os.environ.get("VLLM_DFLASH_LAYER_DEBUG") == "1"
+                        or os.environ.get("VLLM_DFLASH_ATTN_VALUE_DEBUG") == "1"
+                        or _dflash_trace_enabled()
+                    ):
+                        setattr(self.model, "_dflash_in_real_propose", False)
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -1246,7 +1309,16 @@ class SpecDecodeBaseProposer:
                 )
 
             share_embeddings = False
-            if hasattr(self.model, "has_own_embed_tokens"):
+            if (
+                hasattr(self.model, "draft_id_to_target_id")
+                and self.model.draft_id_to_target_id is not None
+            ):
+                logger.info(
+                    "Detected DFlash draft model with draft_id_to_target_id vocab "
+                    "remapping. Keeping separate embedding weights from the target "
+                    "model."
+                )
+            elif hasattr(self.model, "has_own_embed_tokens"):
                 # EAGLE model
                 if not self.model.has_own_embed_tokens:
                     share_embeddings = True
@@ -1301,7 +1373,16 @@ class SpecDecodeBaseProposer:
         the target model's LM head with the draft model to save memory.
         """
         share_lm_head = False
-        if hasattr(self.model, "has_own_lm_head"):
+        if (
+            hasattr(self.model, "draft_id_to_target_id")
+            and self.model.draft_id_to_target_id is not None
+        ):
+            logger.info(
+                "Detected DFlash draft model with draft_id_to_target_id vocab "
+                "remapping. Keeping separate lm_head weights from the target "
+                "model."
+            )
+        elif hasattr(self.model, "has_own_lm_head"):
             # EAGLE model
             if not self.model.has_own_lm_head:
                 share_lm_head = True

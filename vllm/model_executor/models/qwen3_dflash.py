@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable, Mapping
 
 import torch
@@ -12,6 +13,7 @@ from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -54,6 +56,31 @@ logger = init_logger(__name__)
 
 
 _DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
+
+
+def _dflash_trace_enabled() -> bool:
+    return os.environ.get("VLLM_DFLASH_TRACE") == "1"
+
+
+def _dflash_hidden_debug_stats(hidden_states: torch.Tensor) -> tuple[float, float, float]:
+    hs = hidden_states.detach().float()
+    norm_mean = float(hs.norm(dim=-1).mean().item())
+    absmax = float(hs.abs().max().item())
+    cos_offdiag_mean = float("nan")
+    if hs.shape[0] > 1:
+        hs_unit = torch.nn.functional.normalize(hs, dim=-1)
+        cos = hs_unit @ hs_unit.T
+        offdiag = cos[
+            ~torch.eye(cos.shape[0], dtype=torch.bool, device=cos.device)
+        ]
+        cos_offdiag_mean = float(offdiag.mean().item())
+    return norm_mean, absmax, cos_offdiag_mean
+
+
+def _dflash_tail_cos(hidden_states: torch.Tensor) -> float:
+    if hidden_states.shape[0] <= 2:
+        return float("nan")
+    return _dflash_hidden_debug_stats(hidden_states[1:])[2]
 
 
 def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
@@ -107,6 +134,126 @@ class DFlashAttention(Attention):
                 page_size_padded=spec.page_size_padded,
             )
         return spec
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output_shape: torch.Size | None = None,
+    ) -> torch.Tensor:
+        debug_enabled = (
+            (
+                os.environ.get("VLLM_DFLASH_ATTN_VALUE_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and getattr(self, "_dflash_in_real_propose", False)
+            and not getattr(self, "_logged_dflash_attn_value_debug", False)
+        )
+        if debug_enabled:
+            from vllm.model_executor.layers.attention.attention import (
+                get_attention_context,
+            )
+
+            attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
+                self.layer_name
+            )
+            context = get_forward_context()
+            slot_mapping = context.slot_mapping
+            slot_mapping_keys = (
+                list(slot_mapping.keys())[:8] if isinstance(slot_mapping, dict) else None
+            )
+            query_float = query.detach().float()
+            key_float = key.detach().float()
+            value_float = value.detach().float()
+            query_flat = query_float.reshape(query_float.shape[0], -1)
+            key_flat = key_float.reshape(key_float.shape[0], -1)
+            value_flat = value_float.reshape(value_float.shape[0], -1)
+            _, _, query_cos = _dflash_hidden_debug_stats(query_flat)
+            _, _, key_cos = _dflash_hidden_debug_stats(key_flat)
+            _, _, value_cos = _dflash_hidden_debug_stats(value_flat)
+            kv_sample = kv_cache.flatten()[:4096].detach().float()
+            query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+            seq_lens = getattr(attn_metadata, "seq_lens", None)
+            block_table = getattr(attn_metadata, "block_table", None)
+            logger.info(
+                "DFlash attention value debug before: layer=%s, "
+                "metadata=%s, causal=%s, num_actual_tokens=%s, "
+                "max_query_len=%s, max_seq_len=%s, query_start_loc=%s, "
+                "seq_lens=%s, block_table_shape=%s, block_table_sample=%s, "
+                "q_norm=%.6f, k_norm=%.6f, v_norm=%.6f, "
+                "q_absmax=%.6f, k_absmax=%.6f, v_absmax=%.6f, "
+                "q_cos=%.6f, q_tail_cos=%.6f, "
+                "k_cos=%.6f, v_cos=%.6f, "
+                "kv_cache_shape=%s, kv_cache_dtype=%s, "
+                "kv_cache_sample_absmax=%.6f, "
+                "layer_slot_mapping_shape=%s, layer_slot_mapping_sample=%s, "
+                "slot_mapping_keys_sample=%s.",
+                self.layer_name,
+                type(attn_metadata).__name__,
+                getattr(attn_metadata, "causal", None),
+                getattr(attn_metadata, "num_actual_tokens", None),
+                getattr(attn_metadata, "max_query_len", None),
+                getattr(attn_metadata, "max_seq_len", None),
+                (
+                    query_start_loc.detach().cpu().tolist()
+                    if query_start_loc is not None
+                    else None
+                ),
+                (
+                    seq_lens.detach().cpu().tolist() if seq_lens is not None else None
+                ),
+                tuple(block_table.shape) if block_table is not None else None,
+                (
+                    block_table[:2, :8].detach().cpu().tolist()
+                    if block_table is not None and block_table.dim() == 2
+                    else None
+                ),
+                float(query_float.norm(dim=-1).mean().item()),
+                float(key_float.norm(dim=-1).mean().item()),
+                float(value_float.norm(dim=-1).mean().item()),
+                float(query_float.abs().max().item()),
+                float(key_float.abs().max().item()),
+                float(value_float.abs().max().item()),
+                query_cos,
+                _dflash_tail_cos(query_flat),
+                key_cos,
+                value_cos,
+                tuple(kv_cache.shape),
+                kv_cache.dtype,
+                float(kv_sample.abs().max().item()) if kv_sample.numel() else 0.0,
+                (
+                    tuple(layer_slot_mapping.shape)
+                    if layer_slot_mapping is not None
+                    else None
+                ),
+                (
+                    layer_slot_mapping[:16].detach().cpu().tolist()
+                    if layer_slot_mapping is not None
+                    else None
+                ),
+                slot_mapping_keys,
+            )
+
+        output = super().forward(query, key, value, output_shape)
+
+        if debug_enabled:
+            self._logged_dflash_attn_value_debug = True
+            output_float = output.detach().float()
+            logger.info(
+                "DFlash attention value debug after: layer=%s, "
+                "output_shape=%s, output_norm=%.6f, output_absmax=%.6f, "
+                "output_cos=%.6f, output_tail_cos=%.6f.",
+                self.layer_name,
+                tuple(output.shape),
+                float(output_float.norm(dim=-1).mean().item()),
+                float(output_float.abs().max().item()),
+                _dflash_hidden_debug_stats(output_float.reshape(output.shape[0], -1))[
+                    2
+                ],
+                _dflash_tail_cos(output_float.reshape(output.shape[0], -1)),
+            )
+        return output
 
 
 class DFlashQwen3Attention(nn.Module):
@@ -493,12 +640,86 @@ class DFlashQwen3Model(nn.Module):
             cos_sin_cache,
             self._rope_is_neox,
         )
+        all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+
+        if (
+            _dflash_trace_enabled()
+            and context_slot_mapping is not None
+            and not getattr(self, "_logged_dflash_context_kv_trace", False)
+        ):
+            self._logged_dflash_context_kv_trace = True
+            layer_stats = []
+            for i in range(min(L, 5)):
+                k_norm, k_absmax, k_cos = _dflash_hidden_debug_stats(
+                    all_k_final[i].reshape(num_ctx, -1)
+                )
+                v_norm, v_absmax, v_cos = _dflash_hidden_debug_stats(
+                    all_v[i].reshape(num_ctx, -1)
+                )
+                layer_stats.append(
+                    {
+                        "layer": i,
+                        "k_norm": k_norm,
+                        "k_absmax": k_absmax,
+                        "k_cos": k_cos,
+                        "v_norm": v_norm,
+                        "v_absmax": v_absmax,
+                        "v_cos": v_cos,
+                    }
+                )
+
+            ref_max_diff = float("nan")
+            ref_v_max_diff = float("nan")
+            ref_k_cos = float("nan")
+            if num_ctx > 0:
+                attn0 = self.layers[0].self_attn
+                ref_qkv = F.linear(
+                    normed_context_states,
+                    attn0.qkv_proj.weight,
+                    attn0.qkv_proj.bias,
+                )
+                ref_k = ref_qkv[:, attn0.q_size : attn0.q_size + attn0.kv_size]
+                ref_v = ref_qkv[:, attn0.q_size + attn0.kv_size :]
+                ref_k_shape = ref_k.shape
+                ref_k = attn0.k_norm(
+                    ref_k.view(
+                        *ref_k_shape[:-1],
+                        ref_k_shape[-1] // attn0.head_dim,
+                        attn0.head_dim,
+                    )
+                ).view(ref_k_shape)
+                ref_k, _ = attn0.rotary_emb(context_positions, ref_k, None)
+                ref_k = ref_k.view(num_ctx, nkv, hd)
+                ref_v = ref_v.view(num_ctx, nkv, hd)
+                ref_max_diff = float(
+                    (ref_k.float() - all_k_final[0].float()).abs().max().item()
+                )
+                ref_v_max_diff = float(
+                    (ref_v.float() - all_v[0].float()).abs().max().item()
+                )
+                ref_k_cos = _dflash_hidden_debug_stats(ref_k.reshape(num_ctx, -1))[2]
+
+            logger.info(
+                "DFlash trace context KV: num_ctx=%d, positions_tail=%s, "
+                "rope_head_size=%d, rope_rotary_dim=%s, rope_is_neox=%s, "
+                "fused_vs_ref_k_absmax_diff=%.6f, "
+                "fused_vs_ref_v_absmax_diff=%.6f, ref_k_cos=%.6f, "
+                "layer_stats=%s.",
+                num_ctx,
+                context_positions[-min(num_ctx, 16) :].detach().cpu().tolist(),
+                self._rope_head_size,
+                getattr(self.layers[0].self_attn.rotary_emb, "rotary_dim", None),
+                self._rope_is_neox,
+                ref_max_diff,
+                ref_v_max_diff,
+                ref_k_cos,
+                layer_stats,
+            )
 
         if context_slot_mapping is None:
             return
 
         # --- Per-layer cache insert ---
-        all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         for i in range(L):
             attn = self._attn_layers[i]
             layer_slot_mapping = (
@@ -525,15 +746,106 @@ class DFlashQwen3Model(nn.Module):
             input_embeds = self.embed_input_ids(input_ids)
 
         hidden_states = input_embeds
+        debug_env_enabled = (
+            os.environ.get("VLLM_DFLASH_LAYER_DEBUG") == "1"
+            or os.environ.get("VLLM_DFLASH_ATTN_VALUE_DEBUG") == "1"
+            or _dflash_trace_enabled()
+        )
+        in_real_propose = (
+            getattr(self, "_dflash_in_real_propose", False)
+            if debug_env_enabled
+            else False
+        )
+        if debug_env_enabled:
+            for layer in self.layers:
+                setattr(
+                    layer.self_attn.attn,
+                    "_dflash_in_real_propose",
+                    in_real_propose,
+                )
 
         residual = None
-        for layer in self.layers:
+        debug_layer_stats = []
+        debug_enabled = (
+            debug_env_enabled
+            and (
+                os.environ.get("VLLM_DFLASH_LAYER_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and in_real_propose
+            and not getattr(self, "_logged_dflash_layer_debug", False)
+            and hidden_states.shape[0] > 1
+        )
+        if debug_enabled:
+            norm_mean, absmax, cos_mean = _dflash_hidden_debug_stats(hidden_states)
+            debug_layer_stats.append(
+                {
+                    "stage": "embed",
+                    "norm": norm_mean,
+                    "absmax": absmax,
+                    "cos": cos_mean,
+                    "tail_cos": _dflash_tail_cos(hidden_states),
+                }
+            )
+
+        for layer_idx, layer in enumerate(self.layers):
+            if debug_enabled:
+                layer_input = hidden_states
+                if residual is not None:
+                    attn_input, layer_residual = layer.input_layernorm(
+                        layer_input, residual
+                    )
+                else:
+                    layer_residual = layer_input
+                    attn_input = layer.input_layernorm(layer_input)
+                attn_output = layer.self_attn(
+                    positions=positions,
+                    hidden_states=attn_input,
+                )
+                norm_mean, absmax, cos_mean = _dflash_hidden_debug_stats(attn_output)
+                debug_layer_stats.append(
+                    {
+                        "stage": f"layer{layer_idx}.attn",
+                        "norm": norm_mean,
+                        "absmax": absmax,
+                        "cos": cos_mean,
+                        "tail_cos": _dflash_tail_cos(attn_output),
+                    }
+                )
+                hidden_states, residual = layer.post_attention_layernorm(
+                    attn_output, layer_residual
+                )
+                hidden_states = layer.mlp(hidden_states)
+                norm_mean, absmax, cos_mean = _dflash_hidden_debug_stats(hidden_states)
+                debug_layer_stats.append(
+                    {
+                        "stage": f"layer{layer_idx}.mlp",
+                        "norm": norm_mean,
+                        "absmax": absmax,
+                        "cos": cos_mean,
+                        "tail_cos": _dflash_tail_cos(hidden_states),
+                    }
+                )
+                continue
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if debug_enabled:
+            norm_mean, absmax, cos_mean = _dflash_hidden_debug_stats(hidden_states)
+            debug_layer_stats.append(
+                {
+                    "stage": "final_norm",
+                    "norm": norm_mean,
+                    "absmax": absmax,
+                    "cos": cos_mean,
+                    "tail_cos": _dflash_tail_cos(hidden_states),
+                }
+            )
+            self._logged_dflash_layer_debug = True
+            logger.info("DFlash trace layer: %s", debug_layer_stats)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -584,6 +896,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.has_own_lm_head = False
+        self.has_own_embed_tokens = False
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
         target_layer_num = vllm_config.model_config.get_num_layers(
@@ -606,14 +920,22 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             self.config.draft_vocab_size,
             scale=logit_scale,
         )
-        target_vocab_size = vllm_config.model_config.get_vocab_size()
-        if self.config.draft_vocab_size != target_vocab_size:
+        self.target_vocab_size = vllm_config.model_config.get_vocab_size()
+        self.uses_draft_vocab_for_input_ids = (
+            self.model.embed_tokens.org_vocab_size == self.config.draft_vocab_size
+        )
+        if self.config.draft_vocab_size != self.target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
                 torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
                 requires_grad=False,
             )
+            self.target_id_to_draft_id = nn.Parameter(
+                torch.zeros(self.target_vocab_size, dtype=torch.long),
+                requires_grad=False,
+            )
         else:
             self.draft_id_to_target_id = None
+            self.target_id_to_draft_id = None
 
     def embed_input_ids(
         self,
@@ -629,6 +951,16 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if (
+            os.environ.get("VLLM_DFLASH_LAYER_DEBUG") == "1"
+            or os.environ.get("VLLM_DFLASH_ATTN_VALUE_DEBUG") == "1"
+            or _dflash_trace_enabled()
+        ):
+            setattr(
+                self.model,
+                "_dflash_in_real_propose",
+                getattr(self, "_dflash_in_real_propose", False),
+            )
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(
@@ -641,12 +973,53 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
         base = torch.arange(self.config.draft_vocab_size, device=logits.device)
         targets = base + self.draft_id_to_target_id
+        if (
+            (
+                os.environ.get("VLLM_DFLASH_LOGIT_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and not getattr(self, "_logged_dflash_raw_logit_debug", False)
+        ):
+            self._logged_dflash_raw_logit_debug = True
+            top_draft_ids = logits.argmax(dim=-1)
+            top_target_ids = top_draft_ids + self.draft_id_to_target_id[top_draft_ids]
+            hs = hidden_states.detach().float()
+            hs_norm = hs.norm(dim=-1)
+            cos_offdiag_mean = float("nan")
+            cos_offdiag_max = float("nan")
+            if hs.shape[0] > 1:
+                hs_unit = torch.nn.functional.normalize(hs, dim=-1)
+                cos = hs_unit @ hs_unit.T
+                offdiag = cos[~torch.eye(cos.shape[0], dtype=torch.bool,
+                                         device=cos.device)]
+                cos_offdiag_mean = float(offdiag.mean().item())
+                cos_offdiag_max = float(offdiag.max().item())
+            logger.info(
+                "DFlash trace raw logits: hidden_shape=%s, "
+                "hidden_norm_mean=%.6f, hidden_absmax=%.6f, "
+                "hidden_cos_offdiag_mean=%.6f, hidden_cos_offdiag_max=%.6f, "
+                "raw_logits_shape=%s, top_draft_ids=%s, mapped_target_ids=%s.",
+                tuple(hidden_states.shape),
+                float(hs_norm.mean().item()),
+                float(hs.abs().max().item()),
+                cos_offdiag_mean,
+                cos_offdiag_max,
+                tuple(logits.shape),
+                top_draft_ids[:8].detach().cpu().tolist(),
+                top_target_ids[:8].detach().cpu().tolist(),
+            )
         logits_new = logits.new_full(
-            (logits.shape[0], self.config.vocab_size),
+            (logits.shape[0], self.target_vocab_size),
             float("-inf"),
         )
         logits_new[:, targets] = logits
         return logits_new
+
+    def target_ids_to_draft_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.target_id_to_draft_id is None:
+            return input_ids
+        clamped = input_ids.clamp(min=0, max=self.target_id_to_draft_id.shape[0] - 1)
+        return self.target_id_to_draft_id[clamped]
 
     def precompute_and_store_context_kv(
         self,
@@ -672,7 +1045,36 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
+        if os.environ.get("VLLM_DFLASH_NORM_BEFORE_FC") == "1":
+            hidden_states = F.rms_norm(
+                hidden_states,
+                (hidden_states.shape[-1],),
+                eps=self.config.rms_norm_eps,
+            )
         result = self.model.fc(hidden_states)
+        if (
+            (
+                os.environ.get("VLLM_DFLASH_AUX_DEBUG") == "1"
+                or _dflash_trace_enabled()
+            )
+            and not getattr(self, "_logged_dflash_aux_debug", False)
+        ):
+            self._logged_dflash_aux_debug = True
+            flat = hidden_states.detach().float()
+            out = result.detach().float()
+            logger.info(
+                "DFlash trace aux/fc: fc_input_shape=%s, fc_output_shape=%s, "
+                "fc_input_norm_mean=%.6f, fc_input_absmax=%.6f, "
+                "fc_output_norm_mean=%.6f, fc_output_absmax=%.6f, "
+                "fc_output_cos_offdiag_mean=%.6f.",
+                tuple(hidden_states.shape),
+                tuple(result.shape),
+                float(flat.norm(dim=-1).mean().item()),
+                float(flat.abs().max().item()),
+                float(out.norm(dim=-1).mean().item()),
+                float(out.abs().max().item()),
+                _dflash_hidden_debug_stats(result)[2],
+            )
         if needs_squeeze:
             result = result.squeeze(0)
         return result
@@ -680,6 +1082,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}
         includes_draft_id_mapping = False
+        includes_lm_head = False
         includes_embed_tokens = False
         for name, loaded_weight in weights:
             assert "mask_hidden" not in name, (
@@ -687,19 +1090,36 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
             if "t2d" in name:
                 continue
-            if "d2t" in name:
+            elif "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
             elif "lm_head" not in name:
                 name = "model." + name
+            if "lm_head" in name:
+                includes_lm_head = True
+                self.has_own_lm_head = True
             if "embed_tokens" in name:
                 includes_embed_tokens = True
+                self.has_own_embed_tokens = True
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 
         skip_substrs = []
         if not includes_draft_id_mapping:
+            if self.draft_id_to_target_id is not None:
+                raise ValueError(
+                    "DFlash checkpoint uses a truncated draft vocab "
+                    f"({self.config.draft_vocab_size} != {self.target_vocab_size}) "
+                    "but does not include a d2t token mapping."
+                )
             skip_substrs.append("draft_id_to_target_id")
+        skip_substrs.append("target_id_to_draft_id")
+        if self.draft_id_to_target_id is not None and not includes_lm_head:
+            raise ValueError(
+                "DFlash checkpoint uses a truncated draft vocab "
+                f"({self.config.draft_vocab_size} != {self.target_vocab_size}) "
+                "but does not include a draft lm_head."
+            )
         if not includes_embed_tokens:
             skip_substrs.append("embed_tokens")
         if not self.model.use_aux_hidden_state:
@@ -709,5 +1129,116 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_prefixes=None,
             skip_substrs=skip_substrs,
         )
-        loader.load_weights(model_weights.items())
+        loaded_params = loader.load_weights(model_weights.items())
+        if os.environ.get("VLLM_DFLASH_WEIGHT_AUDIT") == "1":
+            expected_params = set(dict(self.named_parameters()).keys())
+            expected_buffers = set(dict(self.named_buffers()).keys())
+            expected_keys = expected_params | expected_buffers
+            checkpoint_keys = set(model_weights.keys())
+            consumed_checkpoint_keys = set(loaded_params)
+            for key in checkpoint_keys:
+                remapped_key = key
+                if "midlayer." in remapped_key:
+                    remapped_key = remapped_key.replace("midlayer.", "layers.0.")
+                for param_name, weight_name in (
+                    (".qkv_proj", ".q_proj"),
+                    (".qkv_proj", ".k_proj"),
+                    (".qkv_proj", ".v_proj"),
+                    (".gate_up_proj", ".gate_proj"),
+                    (".gate_up_proj", ".up_proj"),
+                ):
+                    if weight_name in remapped_key:
+                        remapped_key = remapped_key.replace(weight_name, param_name)
+                        break
+                if remapped_key in loaded_params:
+                    consumed_checkpoint_keys.add(key)
+
+            unused_checkpoint_keys = sorted(checkpoint_keys - consumed_checkpoint_keys)
+            missing_model_keys = sorted(
+                key
+                for key in expected_keys - loaded_params
+                if not any(substr in key for substr in skip_substrs)
+                and not key.endswith("rotary_emb.cos_sin_cache")
+                and "self_attn.attn._" not in key
+            )
+            logger.info(
+                "DFlash weight audit: checkpoint_keys=%d loaded=%d "
+                "unused_checkpoint_keys=%d missing_model_keys=%d.",
+                len(checkpoint_keys),
+                len(loaded_params),
+                len(unused_checkpoint_keys),
+                len(missing_model_keys),
+            )
+            if unused_checkpoint_keys:
+                logger.info(
+                    "DFlash weight audit unused checkpoint keys sample: %s",
+                    unused_checkpoint_keys[:50],
+                )
+            if missing_model_keys:
+                logger.info(
+                    "DFlash weight audit missing model keys sample: %s",
+                    missing_model_keys[:50],
+                )
+        if self.draft_id_to_target_id is not None and includes_draft_id_mapping:
+            target_ids = (
+                torch.arange(
+                    self.config.draft_vocab_size,
+                    device=self.draft_id_to_target_id.device,
+                    dtype=self.draft_id_to_target_id.dtype,
+                )
+                + self.draft_id_to_target_id
+            )
+            draft_ids = torch.arange(
+                self.config.draft_vocab_size,
+                device=self.target_id_to_draft_id.device,
+                dtype=self.target_id_to_draft_id.dtype,
+            )
+            self.target_id_to_draft_id.data.zero_()
+            valid = (target_ids >= 0) & (target_ids < self.target_vocab_size)
+            self.target_id_to_draft_id.data[target_ids[valid]] = draft_ids[valid]
+            logger.info(
+                "Loaded DFlash draft_id_to_target_id mapping for draft vocab "
+                "size %d (target vocab size %d).",
+                self.config.draft_vocab_size,
+                self.target_vocab_size,
+            )
+        if os.environ.get("VLLM_DFLASH_WEIGHT_DEBUG") == "1":
+            fc_weight = getattr(self.model.fc, "weight", None)
+            if fc_weight is not None:
+                logger.info(
+                    "DFlash weight debug: fc.weight shape=%s dtype=%s "
+                    "min=%.6f max=%.6f.",
+                    tuple(fc_weight.shape),
+                    fc_weight.dtype,
+                    float(fc_weight.min().item()),
+                    float(fc_weight.max().item()),
+                )
+            logger.info(
+                "DFlash weight debug: lm_head.weight shape=%s dtype=%s "
+                "min=%.6f max=%.6f.",
+                tuple(self.lm_head.weight.shape),
+                self.lm_head.weight.dtype,
+                float(self.lm_head.weight.min().item()),
+                float(self.lm_head.weight.max().item()),
+            )
+            if hasattr(self.model, "embed_tokens"):
+                logger.info(
+                    "DFlash weight debug: embed_tokens.weight shape=%s dtype=%s "
+                    "min=%.6f max=%.6f.",
+                    tuple(self.model.embed_tokens.weight.shape),
+                    self.model.embed_tokens.weight.dtype,
+                    float(self.model.embed_tokens.weight.min().item()),
+                    float(self.model.embed_tokens.weight.max().item()),
+                )
+            if self.draft_id_to_target_id is not None:
+                logger.info(
+                    "DFlash weight debug: d2t shape=%s min=%d max=%d, "
+                    "t2d shape=%s min=%d max=%d.",
+                    tuple(self.draft_id_to_target_id.shape),
+                    int(self.draft_id_to_target_id.min().item()),
+                    int(self.draft_id_to_target_id.max().item()),
+                    tuple(self.target_id_to_draft_id.shape),
+                    int(self.target_id_to_draft_id.min().item()),
+                    int(self.target_id_to_draft_id.max().item()),
+                )
         self.model._build_fused_kv_buffers()
