@@ -81,6 +81,9 @@ class PendingSave:
     filename: str
     token_ids: torch.Tensor
     block_ids: list[int]
+    save_start_token: int = 0
+    save_end_token: int | None = None
+    loss_start_token: int | None = None
 
 
 @dataclass
@@ -190,7 +193,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         spec_config = self._vllm_config.speculative_config.draft_model_config.hf_config
         self.num_hidden_states = len(
             getattr(spec_config, "eagle_aux_hidden_state_layer_ids", [])
-        )
+        ) + int(getattr(spec_config, "include_final_hidden_state", False))
 
         # Scheduler-side state
         self._pending_saves: dict[str, PendingSave] = {}
@@ -370,7 +373,19 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         )
         slot_mapping = slot_mapping.flatten()
 
-        num_tokens = pending.token_ids.shape[0]
+        total_tokens = pending.token_ids.shape[0]
+        save_start_token = max(pending.save_start_token, 0)
+        save_end_token = (
+            total_tokens if pending.save_end_token is None else pending.save_end_token
+        )
+        save_end_token = min(save_end_token, total_tokens)
+        if save_start_token >= save_end_token:
+            raise ValueError(
+                f"Invalid hidden-state save range for req_id={pending.req_id}: "
+                f"[{save_start_token}, {save_end_token}) with {total_tokens} tokens"
+            )
+        num_tokens = save_end_token - save_start_token
+        slot_mapping = slot_mapping[save_start_token:save_end_token]
 
         copy_stream = self._get_copy_stream()
 
@@ -405,8 +420,13 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         )
         tensors = {
             "hidden_states": pinned_hs,
-            "token_ids": pending.token_ids.clone(),
+            "token_ids": pending.token_ids[save_start_token:save_end_token].clone(),
         }
+        if pending.loss_start_token is not None:
+            loss_mask = torch.arange(
+                save_start_token, save_end_token, dtype=torch.long
+            ) >= pending.loss_start_token
+            tensors["loss_mask"] = loss_mask.to(torch.long)
 
         # Submit to thread pool for disk write.
         prior = self._req_futures.get(pending.req_id)
@@ -540,6 +560,17 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             filename=filename,
             token_ids=token_ids,
             block_ids=list(block_ids),
+            save_start_token=int(kv_params.get("save_start_token", 0)),
+            save_end_token=(
+                None
+                if kv_params.get("save_end_token") is None
+                else int(kv_params["save_end_token"])
+            ),
+            loss_start_token=(
+                None
+                if kv_params.get("loss_start_token") is None
+                else int(kv_params["loss_start_token"])
+            ),
         )
         return True, {"hidden_states_path": filename}
 
