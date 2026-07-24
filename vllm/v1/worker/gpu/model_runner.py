@@ -34,6 +34,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tp_group,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -251,6 +252,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self.direct_hidden_state_params: dict[str, dict[str, Any]] = {}
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -726,6 +728,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
+        self.direct_hidden_state_params.pop(req_id, None)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -775,6 +778,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             prompt_len = len(new_req_data.prompt_token_ids)
             sampling_params = new_req_data.sampling_params
+            extra_args = sampling_params.extra_args if sampling_params else None
+            kv_params = (extra_args or {}).get("kv_transfer_params") or {}
+            if kv_params.get("direct_hidden_states_path") is not None:
+                self.direct_hidden_state_params[req_id] = kv_params
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
@@ -1338,6 +1345,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         finished_req_ids = scheduler_output.finished_req_ids
+        if self.is_last_pp_rank:
+            assert hidden_states is not None
+            self._maybe_dump_direct_hidden_states(
+                hidden_states,
+                aux_hidden_states,
+                input_batch,
+            )
+
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -1491,6 +1506,75 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
 
         return async_output
+
+    def _maybe_dump_direct_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        input_batch: InputBatch,
+    ) -> None:
+        if aux_hidden_states is None or get_tp_group().rank_in_group != 0:
+            return
+
+        for req_index, req_id in enumerate(input_batch.req_ids):
+            kv_params = self.direct_hidden_state_params.get(req_id)
+            if not kv_params:
+                continue
+
+            num_tokens = int(input_batch.num_scheduled_tokens[req_index])
+            if num_tokens <= 0:
+                continue
+
+            chunk_start = int(input_batch.num_computed_tokens_np[req_index])
+            chunk_end = chunk_start + num_tokens
+            save_start = max(int(kv_params.get("save_start_token", 0)), 0)
+            save_end = int(kv_params.get("save_end_token", chunk_end))
+            keep_start = max(chunk_start, save_start)
+            keep_end = min(chunk_end, save_end)
+            if keep_start >= keep_end:
+                continue
+
+            rel_start = keep_start - chunk_start
+            rel_end = keep_end - chunk_start
+            token_start = int(input_batch.query_start_loc_np[req_index])
+            token_rel_start = token_start + rel_start
+            token_rel_end = token_start + rel_end
+            req_state_idx = int(input_batch.idx_mapping_np[req_index])
+
+            token_ids = self.req_states.all_token_ids.gpu[
+                req_state_idx, keep_start:keep_end
+            ].to(device="cpu", dtype=torch.long)
+            loss_start = kv_params.get("loss_start_token")
+            if loss_start is None:
+                loss_mask = torch.ones_like(token_ids, dtype=torch.long)
+            else:
+                loss_mask = (
+                    torch.arange(keep_start, keep_end, dtype=torch.long)
+                    >= int(loss_start)
+                ).to(torch.long)
+
+            hidden = hidden_states[token_rel_start:token_rel_end].detach().cpu()
+            aux_hidden = torch.cat(
+                [
+                    aux[token_rel_start:token_rel_end]
+                    for aux in aux_hidden_states
+                ],
+                dim=-1,
+            ).detach().cpu()
+
+            path = kv_params["direct_hidden_states_path"]
+            part_path = f"{path}.part_{keep_start}_{keep_end}.pt"
+            torch.save(
+                {
+                    "start": keep_start,
+                    "end": keep_end,
+                    "input_ids": token_ids,
+                    "loss_mask": loss_mask,
+                    "hidden_state": hidden,
+                    "aux_hidden_state": aux_hidden,
+                },
+                part_path,
+            )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()

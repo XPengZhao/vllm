@@ -73,7 +73,10 @@ class ExtractHiddenStatesProposer:
                 "eagle_aux_hidden_state_layer_ids must be set in the draft "
                 "model config for extract_hidden_states method"
             )
-        self.num_hidden_states = len(layer_ids)
+        self.include_final_hidden_state = getattr(
+            self.hf_config, "include_final_hidden_state", False
+        )
+        self.num_hidden_states = len(layer_ids) + int(self.include_final_hidden_state)
         self.hidden_size = vllm_config.model_config.get_hidden_size()
         self.hidden_states = torch.zeros(
             (self.max_num_tokens, self.num_hidden_states, self.hidden_size),
@@ -96,6 +99,7 @@ class ExtractHiddenStatesProposer:
         sampled_token_ids: torch.Tensor,
         target_hidden_states: list[torch.Tensor],
         common_attn_metadata: CommonAttentionMetadata,
+        final_hidden_states: torch.Tensor | None = None,
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
@@ -114,6 +118,8 @@ class ExtractHiddenStatesProposer:
             sampled_token_ids: Sampled token IDs from the target model
             target_hidden_states: List of hidden state tensors from target model
                                 (one per aux hidden state layer)
+            final_hidden_states: Optional final target hidden states to cache before
+                                 auxiliary hidden states.
             common_attn_metadata: Attention metadata
             slot_mappings: Slot mappings for KV cache (unused, provided for
                           interface compatibility)
@@ -125,6 +131,13 @@ class ExtractHiddenStatesProposer:
         """
         assert num_speculative_tokens == self.num_speculative_tokens
         assert self.model is not None and isinstance(target_hidden_states, list)
+
+        if self.include_final_hidden_state:
+            if final_hidden_states is None:
+                raise ValueError(
+                    "final_hidden_states is required when include_final_hidden_state=True"
+                )
+            target_hidden_states = [final_hidden_states, *target_hidden_states]
 
         # target_hidden_states is a list of tensors (one per layer)
         # Each tensor has shape [num_tokens, hidden_size]

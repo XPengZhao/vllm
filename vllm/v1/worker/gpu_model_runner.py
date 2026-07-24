@@ -4988,6 +4988,7 @@ class GPUModelRunner(
                 num_speculative_tokens=num_spec_tokens_to_schedule,
                 sampled_token_ids=sampled_token_ids,
                 target_hidden_states=target_hidden_states,
+                final_hidden_states=hidden_states[:num_scheduled_tokens],
                 common_attn_metadata=common_attn_metadata,
                 slot_mappings=slot_mappings,
             )
