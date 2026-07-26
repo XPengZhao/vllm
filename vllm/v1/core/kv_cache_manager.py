@@ -260,6 +260,12 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        kv_transfer_params = request.kv_transfer_params or {}
+        if kv_transfer_params.get("direct_hidden_states_path") is not None:
+            save_start_token = max(
+                int(kv_transfer_params.get("save_start_token", 0)), 0
+            )
+            max_cache_hit_length = min(max_cache_hit_length, save_start_token)
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
