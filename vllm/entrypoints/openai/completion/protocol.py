@@ -558,6 +558,7 @@ class CompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    spec_decode: dict[str, Any] | None = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):

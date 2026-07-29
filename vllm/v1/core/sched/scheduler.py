@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -1595,12 +1595,22 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
+                if scheduler_output.num_invalid_spec_tokens:
+                    num_draft_tokens -= scheduler_output.num_invalid_spec_tokens.get(
+                        req_id, 0
+                    )
+                if num_draft_tokens:
+                    if request.spec_decoding_stats is None:
+                        request.spec_decoding_stats = SpecDecodingStats.new(
+                            self.num_spec_tokens
+                        )
+                    request.spec_decoding_stats.observe_draft(
+                        num_draft_tokens, num_accepted
+                    )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-                    request_id=req_id,
                 )
 
             # Free encoder inputs only after the step has actually executed.
@@ -1731,6 +1741,11 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        spec_decode_stats=(
+                            asdict(request.spec_decoding_stats)
+                            if request.spec_decoding_stats is not None
+                            else None
+                        ),
                     )
                 )
             else:
@@ -2297,15 +2312,11 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None,
         num_draft_tokens: int,
         num_accepted_tokens: int,
-        num_invalid_spec_tokens: dict[str, int] | None,
-        request_id: str,
     ) -> SpecDecodingStats | None:
         if not self.log_stats or not num_draft_tokens:
             return None
         if spec_decoding_stats is None:
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
-        if num_invalid_spec_tokens:
-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )

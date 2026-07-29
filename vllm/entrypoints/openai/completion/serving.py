@@ -599,6 +599,11 @@ class OpenAIServingCompletion(OpenAIServing):
             usage=usage,
             system_fingerprint=self.system_fingerprint,
             kv_transfer_params=kv_transfer_params,
+            spec_decode=(
+                final_res_batch[0].spec_decode_stats
+                if len(final_res_batch) == 1
+                else None
+            ),
         )
 
     def _create_completion_logprobs(
