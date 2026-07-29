@@ -650,6 +650,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
             metrics=per_request_metrics,
+            spec_decode=(
+                final_res_batch[0].spec_decode_stats
+                if len(final_res_batch) == 1
+                else None
+            ),
         )
 
     def _create_completion_logprobs(

@@ -212,6 +212,7 @@ class EngineCoreOutput(
     events: list[EngineCoreEvent] | None = None
     kv_transfer_params: dict[str, Any] | None = None
     ec_transfer_params: dict[str, Any] | None = None
+    spec_decode_stats: dict[str, Any] | None = None
 
     trace_headers: Mapping[str, str] | None = None
 

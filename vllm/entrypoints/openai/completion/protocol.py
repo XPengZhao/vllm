@@ -661,6 +661,7 @@ class CompletionResponse(OpenAIBaseModel):
         default=None, description="ECTransfer parameters."
     )
     metrics: PerRequestMetrics | None = None
+    spec_decode: dict[str, Any] | None = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
