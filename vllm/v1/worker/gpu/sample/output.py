@@ -20,6 +20,8 @@ class SamplerOutput:
     num_sampled: torch.Tensor | None
     num_rejected: torch.Tensor | None = None
     sampling_mask_tensors: SamplingMaskTensors | None = None
+    spec_target_logprobs: torch.Tensor | None = None
+    spec_draft_token_ids: torch.Tensor | None = None
 
 
 @triton.jit

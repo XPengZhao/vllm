@@ -1837,6 +1837,17 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            spec_target_logprobs = (
+                model_runner_output.spec_target_logprobs[req_index]
+                if model_runner_output.spec_target_logprobs is not None
+                else None
+            )
+            spec_draft_token_ids = (
+                model_runner_output.spec_draft_token_ids[req_index]
+                if model_runner_output.spec_draft_token_ids is not None
+                else None
+            )
+            spec_decode_trace_entry: dict[str, Any] | None = None
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1870,6 +1881,23 @@ class Scheduler(SchedulerInterface):
                         request.spec_decoding_stats.observe_draft(
                             adj_draft_tokens, num_accepted
                         )
+                        if request.collect_spec_decode_trace:
+                            if spec_draft_token_ids is None:
+                                raise RuntimeError(
+                                    "Missing draft token IDs for speculative trace"
+                                )
+                            spec_decode_trace_entry = {
+                                "response_prefix_length": request.num_output_tokens,
+                                "draft_token_ids": spec_draft_token_ids[
+                                    :num_draft_tokens
+                                ],
+                                "accepted_length": num_accepted,
+                                "target_logprobs": (
+                                    spec_target_logprobs[:num_draft_tokens]
+                                    if spec_target_logprobs is not None
+                                    else None
+                                ),
+                            }
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -2040,6 +2068,16 @@ class Scheduler(SchedulerInterface):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if should_emit_output:
                 # Add EngineCoreOutput for this Request.
+                request_spec_decode_stats = (
+                    asdict(request.spec_decoding_stats)
+                    if request.spec_decoding_stats is not None
+                    else None
+                )
+                if (
+                    request_spec_decode_stats is not None
+                    and spec_decode_trace_entry is not None
+                ):
+                    request_spec_decode_stats["trace_entry"] = spec_decode_trace_entry
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -2062,11 +2100,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
-                        spec_decode_stats=(
-                            asdict(request.spec_decoding_stats)
-                            if request.spec_decoding_stats is not None
-                            else None
-                        ),
+                        spec_decode_stats=request_spec_decode_stats,
                     )
                 )
             else:

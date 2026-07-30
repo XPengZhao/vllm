@@ -319,6 +319,11 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
+    # Target log probabilities for speculative draft candidates, padded per
+    # request. Populated only for explicit speculative trace collection.
+    spec_target_logprobs: list[list[float]] | None = None
+    spec_draft_token_ids: list[list[int]] | None = None
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]
