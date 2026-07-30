@@ -253,6 +253,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
         self.direct_hidden_state_params: dict[str, dict[str, Any]] = {}
+        self.spec_decode_trace_req_ids: set[str] = set()
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -729,6 +730,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _remove_request(self, req_id: str) -> bool:
         self.direct_hidden_state_params.pop(req_id, None)
+        self.spec_decode_trace_req_ids.discard(req_id)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -782,6 +784,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_params = (extra_args or {}).get("kv_transfer_params") or {}
             if kv_params.get("direct_hidden_states_path") is not None:
                 self.direct_hidden_state_params[req_id] = kv_params
+            if (extra_args or {}).get("collect_spec_decode_trace"):
+                self.spec_decode_trace_req_ids.add(req_id)
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
@@ -1081,6 +1085,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
+                collect_spec_target_logprobs=any(
+                    req_id in self.spec_decode_trace_req_ids
+                    for req_id in input_batch.req_ids
+                ),
             )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected

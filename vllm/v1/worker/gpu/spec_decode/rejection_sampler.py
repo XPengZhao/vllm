@@ -98,11 +98,50 @@ class RejectionSampler:
             input_batch.cu_num_logits_np.tolist() if expanded_logits else None,
         )
 
+    def _get_spec_target_data(
+        self,
+        input_batch: InputBatch,
+        draft_sampled: torch.Tensor,
+        processed_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        num_draft_tokens = input_batch.num_draft_tokens_per_req
+        if num_draft_tokens is None or not num_draft_tokens.any():
+            return None
+
+        num_reqs = len(input_batch.req_ids)
+        max_num_draft = int(num_draft_tokens.max())
+        target_logprobs = processed_logits.new_full(
+            (num_reqs, max_num_draft), float("nan"), dtype=torch.float32
+        )
+        draft_token_ids = torch.full(
+            (num_reqs, max_num_draft),
+            -1,
+            dtype=torch.int64,
+            device=processed_logits.device,
+        )
+        cu_num_logits = input_batch.cu_num_logits_np
+        for req_idx, num_draft in enumerate(num_draft_tokens.tolist()):
+            if num_draft == 0:
+                continue
+            start = int(cu_num_logits[req_idx])
+            rows = torch.arange(
+                start, start + num_draft, device=processed_logits.device
+            )
+            token_ids = draft_sampled[start + 1 : start + num_draft + 1].long()
+            candidate_logits = processed_logits[rows, token_ids].float()
+            log_normalizer = torch.logsumexp(processed_logits[rows].float(), dim=-1)
+            target_logprobs[req_idx, :num_draft] = (
+                candidate_logits - log_normalizer
+            ).clamp_min(-80.0)
+            draft_token_ids[req_idx, :num_draft] = token_ids
+        return target_logprobs, draft_token_ids
+
     def __call__(
         self,
         logits: torch.Tensor,
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
+        collect_spec_target_logprobs: bool = False,
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -142,6 +181,18 @@ class RejectionSampler:
             if self.sampler.logprobs_mode == "processed_logprobs"
             else logits,
         )
+        spec_target_data = (
+            self._get_spec_target_data(
+                input_batch,
+                draft_sampled,
+                processed_logits,
+            )
+            if collect_spec_target_logprobs
+            else None
+        )
+        spec_target_logprobs, spec_draft_token_ids = (
+            spec_target_data if spec_target_data is not None else (None, None)
+        )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
@@ -157,4 +208,6 @@ class RejectionSampler:
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+            spec_target_logprobs=spec_target_logprobs,
+            spec_draft_token_ids=spec_draft_token_ids,
         )

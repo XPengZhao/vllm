@@ -14,3 +14,5 @@ class SamplerOutput:
     num_nans: torch.Tensor | None
     num_sampled: torch.Tensor | None
     num_rejected: torch.Tensor | None = None
+    spec_target_logprobs: torch.Tensor | None = None
+    spec_draft_token_ids: torch.Tensor | None = None

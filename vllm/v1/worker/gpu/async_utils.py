@@ -38,6 +38,16 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.num_nans: np.ndarray | None = None
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
+            self.spec_target_logprobs: np.ndarray | None = None
+            if sampler_output.spec_target_logprobs is not None:
+                self.spec_target_logprobs = async_copy_to_np(
+                    sampler_output.spec_target_logprobs
+                )
+            self.spec_draft_token_ids: np.ndarray | None = None
+            if sampler_output.spec_draft_token_ids is not None:
+                self.spec_draft_token_ids = async_copy_to_np(
+                    sampler_output.spec_draft_token_ids
+                )
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
             self.prompt_logprobs_dict = {
                 k: v.to_cpu_nonblocking() if v is not None else None
@@ -65,6 +75,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
+        if self.spec_target_logprobs is not None:
+            self.model_runner_output.spec_target_logprobs = (
+                self.spec_target_logprobs.tolist()
+            )
+        if self.spec_draft_token_ids is not None:
+            self.model_runner_output.spec_draft_token_ids = (
+                self.spec_draft_token_ids.tolist()
+            )
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
         return self.model_runner_output
 

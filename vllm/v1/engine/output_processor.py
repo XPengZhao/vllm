@@ -177,6 +177,7 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
+        self.spec_decode_trace: list[dict[str, Any]] | None = None
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -651,13 +652,26 @@ class OutputProcessor:
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
             # 4) Create and handle RequestOutput objects.
+            spec_decode_stats = engine_core_output.spec_decode_stats
+            if spec_decode_stats is not None:
+                trace_entry = spec_decode_stats.pop("trace_entry", None)
+                if trace_entry is not None:
+                    if req_state.spec_decode_trace is None:
+                        req_state.spec_decode_trace = []
+                    req_state.spec_decode_trace.append(trace_entry)
+                if finish_reason is not None and req_state.spec_decode_trace:
+                    assert req_state.detokenizer is not None
+                    spec_decode_stats["trace"] = req_state.spec_decode_trace
+                    spec_decode_stats["verified_token_ids"] = list(
+                        req_state.detokenizer.output_token_ids
+                    )
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 pooling_output,
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
-                engine_core_output.spec_decode_stats,
+                spec_decode_stats,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

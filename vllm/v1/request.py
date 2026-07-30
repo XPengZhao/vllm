@@ -154,6 +154,11 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
         self.spec_decoding_stats: SpecDecodingStats | None = None
+        self.collect_spec_decode_trace = bool(
+            sampling_params
+            and sampling_params.extra_args
+            and sampling_params.extra_args.get("collect_spec_decode_trace")
+        )
 
         # Multi-modal related
         self.mm_features = mm_features or []

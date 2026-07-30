@@ -125,6 +125,78 @@ def rows_dir_for(output_root: Path, index: int, group_size: int = 2000) -> Path:
     return output_root / f"rows_{start}-{end}"
 
 
+def build_opd_features(
+    row: dict[str, Any],
+    *,
+    response_start: int,
+    save_start: int,
+) -> dict[str, torch.Tensor]:
+    target_rollout = row.get("target_rollout")
+    spec_decode = (
+        target_rollout.get("spec_decode")
+        if isinstance(target_rollout, dict)
+        else None
+    )
+    trace = spec_decode.get("trace") if isinstance(spec_decode, dict) else None
+    if trace is None:
+        return {}
+    if not isinstance(trace, list):
+        raise ValueError("target_rollout.spec_decode.trace must be a list")
+
+    records: list[tuple[int, list[int], list[float], int]] = []
+    for entry in trace:
+        if not isinstance(entry, dict):
+            raise ValueError("each speculative trace entry must be an object")
+        prefix_length = entry.get("response_prefix_length")
+        draft_token_ids = entry.get("draft_token_ids")
+        target_logprobs = entry.get("target_logprobs")
+        accepted_length = entry.get("accepted_length")
+        if (
+            not isinstance(prefix_length, int)
+            or not isinstance(draft_token_ids, list)
+            or not isinstance(target_logprobs, list)
+            or not isinstance(accepted_length, int)
+            or len(draft_token_ids) != len(target_logprobs)
+        ):
+            raise ValueError(f"invalid speculative trace entry: {entry}")
+        anchor = response_start + prefix_length - 1 - save_start
+        if anchor < 0:
+            raise ValueError(f"speculative anchor precedes saved context: {anchor}")
+        records.append(
+            (
+                anchor,
+                [int(token_id) for token_id in draft_token_ids],
+                [float(logprob) for logprob in target_logprobs],
+                accepted_length,
+            )
+        )
+
+    max_candidates = max((len(record[1]) for record in records), default=0)
+    num_blocks = len(records)
+    anchor_positions = torch.zeros(num_blocks, dtype=torch.long)
+    draft_token_ids = torch.zeros(
+        num_blocks, max_candidates, dtype=torch.long
+    )
+    target_logprobs = torch.zeros(num_blocks, max_candidates, dtype=torch.float32)
+    accepted_lengths = torch.zeros(num_blocks, dtype=torch.long)
+    candidate_mask = torch.zeros(num_blocks, max_candidates, dtype=torch.bool)
+    for index, (anchor, token_ids, logprobs, accepted_length) in enumerate(records):
+        count = len(token_ids)
+        anchor_positions[index] = anchor
+        accepted_lengths[index] = min(accepted_length, count)
+        if count:
+            draft_token_ids[index, :count] = torch.tensor(token_ids)
+            target_logprobs[index, :count] = torch.tensor(logprobs)
+            candidate_mask[index, :count] = True
+    return {
+        "opd_anchor_positions": anchor_positions,
+        "opd_draft_token_ids": draft_token_ids,
+        "opd_target_logprobs": target_logprobs,
+        "opd_accepted_lengths": accepted_lengths,
+        "opd_candidate_mask": candidate_mask,
+    }
+
+
 def merge_direct_parts(
     prefix: Path,
     dst: Path,
@@ -133,6 +205,7 @@ def merge_direct_parts(
     save_start: int,
     save_end: int,
     response_start: int,
+    row: dict[str, Any],
 ) -> None:
     parts = sorted(
         prefix.parent.glob(prefix.name + ".part_*_*.pt"),
@@ -199,6 +272,13 @@ def merge_direct_parts(
             "response_start": response_start,
         },
     }
+    sample.update(
+        build_opd_features(
+            row,
+            response_start=response_start,
+            save_start=save_start,
+        )
+    )
     dst.parent.mkdir(parents=True, exist_ok=True)
     torch.save(sample, dst)
     if not keep_parts:
@@ -272,6 +352,7 @@ def main() -> None:
             save_start=save_start,
             save_end=save_end,
             response_start=response_start,
+            row=row,
         )
 
 
