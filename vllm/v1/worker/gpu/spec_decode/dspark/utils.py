@@ -51,6 +51,14 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         vllm_config.attention_config.backend,
     )
 
+    floating_draft = (
+        getattr(
+            draft_model_config.hf_config,
+            "dspark_draft_overlay_format",
+            None,
+        )
+        == "floating"
+    )
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
@@ -69,7 +77,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     )
     # VllmConfig post-init restores the target's quant config because the target
     # config is retained for DSpark's target-layer metadata, so we must override it.
-    draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+    draft_vllm_config.quant_config = (
+        None if floating_draft else get_draft_quant_config(vllm_config)
+    )
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(
