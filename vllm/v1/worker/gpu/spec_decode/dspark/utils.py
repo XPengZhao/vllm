@@ -18,6 +18,14 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     # DSpark uses non-causal attention.
     causal = False
+    floating_draft = (
+        getattr(
+            draft_model_config.hf_config,
+            "dspark_draft_overlay_format",
+            None,
+        )
+        == "floating"
+    )
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
@@ -26,6 +34,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             backend=speculative_config.attention_backend,
         ),
     )
+    if floating_draft:
+        draft_vllm_config.quant_config = None
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(
