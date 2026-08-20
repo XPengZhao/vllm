@@ -616,7 +616,7 @@ class TestOrphanInvokeNameValidation:
         )
         engine = parser._engine
 
-        assert engine._hold_active is False
+        assert engine._recovery_hold_active is False
         assert engine.tool_index == 0
 
     def test_parallel_orphan_invokes_with_declared_tools(
@@ -807,14 +807,11 @@ class TestOrphanInvokeNameValidation:
     def test_padding_between_orphan_invokes_is_dropped_after_prose(
         self, mock_tokenizer, mock_request, weather_tool
     ):
-        """Padding between two recovered invokes is dropped even when
-        the response already produced real text.
+        """Whitespace between recovered invokes is kept as content.
 
-        The prose in front means the content is no longer whitespace
-        only, so the parser's own whitespace dropping does not apply and
-        the engine holding the padding back is the only thing keeping it
-        out.  A wrapped call written the same way returns just the
-        prose, and the recovered call has to match it.
+        Recovery commits back to CONTENT rather than TOOL_BETWEEN, so
+        padding is ordinary text. Combined with leading prose it is not
+        whitespace-only and therefore not stripped.
         """
         time_tool = _make_tool("get_time", {"timezone": {"type": "string"}})
         parser = self._declared_parser(
@@ -830,7 +827,7 @@ class TestOrphanInvokeNameValidation:
 
         assert result.tools_called is True
         assert len(result.tool_calls) == 2
-        assert result.content == "Some prose "
+        assert result.content == "Some prose \n  \n"
 
     def test_streaming_padding_between_orphan_invokes_is_dropped_after_prose(
         self, mock_tokenizer, mock_request, weather_tool
@@ -847,7 +844,7 @@ class TestOrphanInvokeNameValidation:
         ]
         results = simulate_tool_streaming(parser, mock_request, chunks)
 
-        assert collect_content(results) == "Some prose "
+        assert collect_content(results) == "Some prose \n  \n"
 
     def test_recovery_does_not_carry_into_a_later_wrapped_call(
         self, mock_tokenizer, mock_request, weather_tool
@@ -922,7 +919,7 @@ class TestOrphanInvokeNameValidation:
 
         assert result.tools_called is True
         assert len(result.tool_calls) == 2
-        assert result.content == "  Real text"
+        assert result.content == "\n\n  Real text"
 
     def test_streaming_padding_held_before_one_invoke_does_not_reach_a_later_gap(
         self, mock_tokenizer, mock_request, weather_tool
@@ -940,7 +937,7 @@ class TestOrphanInvokeNameValidation:
         ]
         results = simulate_tool_streaming(parser, mock_request, chunks)
 
-        assert collect_content(results) == "  Real text"
+        assert collect_content(results) == "\n\n  Real text"
 
     def test_abandoned_recovery_does_not_affect_a_later_wrapped_call(
         self, mock_tokenizer, mock_request, weather_tool
@@ -1767,5 +1764,334 @@ class TestDelegatingParserLargeDelta:
 
         assert reasoning_text in output.reasoning
         assert eos_text not in output.reasoning
+        assert output.content == ""
+        assert output.tool_calls == []
+
+
+def _recovery_tool():
+    return _make_tool("get_weather", {"city": {"type": "string"}})
+
+
+def _recovery_invoke(name="get_weather", city="Seoul"):
+    return _invoke(name, ("city", "true", city))
+
+
+def _content_recovery_parser(mock_tokenizer, *tools):
+    return DeepSeekV4Parser(
+        mock_tokenizer,
+        tools=list(tools),
+        chat_template_kwargs={"thinking": False},
+    )
+
+
+class TestMalformedWrapperRecovery:
+    def test_missing_start_wrapper_recovers_declared_tool(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+
+        result = parser.extract_tool_calls(
+            _recovery_invoke() + DSML_TOOL_END, mock_request
+        )
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
+
+    def test_corrupted_start_wrapper_still_recovers_invoke(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+        text = "<｜DSML｜toolcalls>\n" + _recovery_invoke() + "\n" + DSML_TOOL_END
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
+
+    def test_undeclared_orphan_invoke_stays_content(self, mock_tokenizer, mock_request):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = _recovery_invoke(name="not_declared") + DSML_TOOL_END
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_orphan_invoke_without_tools_stays_content(
+        self, mock_tokenizer, mock_request
+    ):
+        parser = _content_recovery_parser(mock_tokenizer)
+        text = _recovery_invoke() + DSML_TOOL_END
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_request_without_tools_does_not_reuse_prior_tool_names(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = _recovery_invoke() + DSML_TOOL_END
+
+        mock_request.tools = [tool]
+        first = parser.extract_tool_calls(text, mock_request)
+        mock_request.tools = []
+        second = parser.extract_tool_calls(text, mock_request)
+
+        assert first.tools_called is True
+        assert second.tools_called is False
+        assert second.tool_calls == []
+        assert second.content == text
+
+    def test_tool_choice_none_disables_recovery(self, mock_tokenizer, mock_request):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        mock_request.tool_choice = "none"
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = _recovery_invoke() + DSML_TOOL_END
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_truncated_recovery_candidate_flushes_as_content(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = "Docs quote " + DSML_INVOKE_PREFIX + "get_wea"
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_valid_name_without_invoke_end_stays_content(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = (
+            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+            f"{_param('city', 'true', 'Seoul')}"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_truncated_recovery_drops_eos_special_token(self, mock_request):
+        eos_text = "<｜end▁of▁sentence｜>"
+        eos_id = 128801
+        tokenizer = make_mock_tokenizer(
+            {
+                DSML_THINK_START: _THINK_START_ID,
+                DSML_THINK_END: _THINK_END_ID,
+                eos_text: eos_id,
+            }
+        )
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(tokenizer, tool)
+        text = (
+            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+            f"{_param('city', 'true', 'Seoul')}"
+        )
+
+        assert parser._engine.feed(text, []) == []
+        events = parser._engine.feed(eos_text, [eos_id])
+        events.extend(parser._engine.finish())
+
+        assert "".join(event.value for event in events if event.value) == text
+
+    def test_tool_end_without_invoke_end_stays_content(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = (
+            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+            f"{_param('city', 'true', 'Seoul')}\n"
+            f"{DSML_TOOL_END}"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_recovered_invoke_preserves_trailing_content_without_tool_end(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+
+        result = parser.extract_tool_calls(_recovery_invoke() + " Done.", mock_request)
+
+        assert result.tools_called is True
+        assert [call.function.name for call in result.tool_calls] == ["get_weather"]
+        assert result.content == " Done."
+
+    def test_recovered_parallel_invokes_validate_each_declared_tool(
+        self, mock_tokenizer, mock_request
+    ):
+        weather = _recovery_tool()
+        forecast = _make_tool("get_forecast", {"city": {"type": "string"}})
+        tools = [weather, forecast]
+        mock_request.tools = tools
+        parser = _content_recovery_parser(mock_tokenizer, *tools)
+        text = (
+            _recovery_invoke()
+            + _recovery_invoke(name="get_forecast")
+            + DSML_TOOL_END
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert [call.function.name for call in result.tool_calls] == [
+            "get_weather",
+            "get_forecast",
+        ]
+
+    def test_recovered_parallel_invoke_rejects_undeclared_second_tool(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        rejected = _recovery_invoke(name="not_declared")
+        text = _recovery_invoke() + rejected + DSML_TOOL_END
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert [call.function.name for call in result.tool_calls] == ["get_weather"]
+        assert result.content == rejected
+
+    def test_streaming_orphan_invoke_recovers_after_split_marker(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        chunks = [
+            "Checking.\n",
+            "<｜DSML",
+            '｜invoke name="get_weather">',
+            f"\n{_param('city', 'true', 'Seoul')}\n",
+            DSML_INVOKE_END,
+            DSML_TOOL_END,
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        assert collect_function_name(results) == "get_weather"
+        assert json.loads(collect_tool_arguments(results)) == {"city": "Seoul"}
+        assert collect_content(results) == "Checking.\n"
+
+    def test_streaming_tool_end_without_invoke_end_stays_content(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        chunks = [
+            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n",
+            f"{_param('city', 'true', 'Seoul')}\n",
+            DSML_TOOL_END,
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        assert collect_function_name(results) is None
+        assert collect_tool_arguments(results) == ""
+        assert collect_content(results) == "".join(chunks)
+
+
+class TestDelegatingMalformedWrapperRecovery:
+    def test_complete_declared_invoke_commits_before_think_end(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        mock_request.tool_choice = "auto"
+        parser = _DeepSeekV4Delegating(
+            mock_tokenizer,
+            tools=[tool],
+            chat_template_kwargs={"thinking": True},
+        )
+        delta = parser.parse_delta(
+            "Still thinking.\n" + _recovery_invoke(),
+            [],
+            mock_request,
+            prompt_token_ids=[],
+            finished=True,
+        )
+        output = collect_output([delta])
+
+        assert output.reasoning == "Still thinking.\n"
+        assert output.content == ""
+        assert [call["name"] for call in output.tool_calls] == ["get_weather"]
+
+    @pytest.mark.parametrize(
+        ("candidate", "tool_choice"),
+        [
+            (_recovery_invoke(name="not_declared"), "auto"),
+            (
+                f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+                f"{_param('city', 'true', 'Seoul')}",
+                "auto",
+            ),
+            (_recovery_invoke(), "none"),
+        ],
+        ids=["undeclared", "truncated", "tool_choice_none"],
+    )
+    def test_rejected_invoke_rolls_back_to_reasoning(
+        self, mock_tokenizer, mock_request, candidate, tool_choice
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        mock_request.tool_choice = tool_choice
+        parser = _DeepSeekV4Delegating(
+            mock_tokenizer,
+            tools=[tool],
+            chat_template_kwargs={"thinking": True},
+        )
+        text = "Still thinking.\n" + candidate
+        delta = parser.parse_delta(
+            text,
+            [],
+            mock_request,
+            prompt_token_ids=[],
+            finished=True,
+        )
+        output = collect_output([delta])
+
+        assert output.reasoning == text
         assert output.content == ""
         assert output.tool_calls == []

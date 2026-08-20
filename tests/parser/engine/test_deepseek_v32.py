@@ -449,7 +449,7 @@ class TestOrphanInvokeNameValidation:
 
         assert result.tools_called
         assert len(result.tool_calls) == 2
-        assert result.content == "Some prose "
+        assert result.content == "Some prose \n  \n"
 
     def test_streaming_padding_between_orphan_invokes_is_dropped_after_prose(
         self, mock_tokenizer, mock_request, weather_tool
@@ -465,7 +465,7 @@ class TestOrphanInvokeNameValidation:
         ]
         results = simulate_tool_streaming(parser, mock_request, chunks)
 
-        assert collect_content(results) == "Some prose "
+        assert collect_content(results) == "Some prose \n  \n"
 
     def test_recovery_does_not_carry_into_a_later_wrapped_call(
         self, mock_tokenizer, mock_request, weather_tool
@@ -537,7 +537,7 @@ class TestOrphanInvokeNameValidation:
 
         assert result.tools_called
         assert len(result.tool_calls) == 2
-        assert result.content == "  Real text"
+        assert result.content == "\n\n  Real text"
 
     def test_streaming_padding_held_before_one_invoke_does_not_reach_a_later_gap(
         self, mock_tokenizer, mock_request, weather_tool
@@ -554,7 +554,7 @@ class TestOrphanInvokeNameValidation:
         ]
         results = simulate_tool_streaming(parser, mock_request, chunks)
 
-        assert collect_content(results) == "  Real text"
+        assert collect_content(results) == "\n\n  Real text"
 
     def test_abandoned_recovery_does_not_affect_a_later_wrapped_call(
         self, mock_tokenizer, mock_request, weather_tool

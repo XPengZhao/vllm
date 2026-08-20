@@ -31,6 +31,7 @@ from vllm.parser.deepseek_v4 import (
     _dsml_arg_converter,
     _unwrap_wrapper_args,
 )
+from vllm.tool_parsers.utils import find_tool_name
 from vllm.parser.engine.events import EventType
 from vllm.parser.engine.parser_engine import ParserEngine
 from vllm.parser.engine.parser_engine_config import (
@@ -75,14 +76,12 @@ def deepseek_v32_config() -> ParserEngineConfig:
             ),
             # Orphan invoke: at long context the model may omit the
             # <｜DSML｜function_calls> wrapper and emit the invoke
-            # directly.  The invoke marker has no dedicated special
-            # token, so hold events and validate the parsed name
-            # before committing.  Only names the request declared are
-            # accepted.
+            # directly. Hold this recovery path until the call ends and
+            # verify that the request actually declared the name.
             (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
-                validate_tool_name=True,
+                provisional_tool_call=True,
             ),
             # V4-style tool_calls wrapper is foreign to V3.2: pass it
             # and its contents through as plain content
@@ -112,6 +111,7 @@ def deepseek_v32_config() -> ParserEngineConfig:
             (ParserState.TOOL_ARGS, "INVOKE_END"): Transition(
                 ParserState.TOOL_BETWEEN,
                 (EventType.TOOL_CALL_END,),
+                commit_provisional_tool_call=True,
             ),
             (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
                 ParserState.CONTENT,
@@ -155,6 +155,22 @@ class DeepSeekV32Parser(ParserEngine):
             **kwargs,
         )
         self._arg_converter = self._convert_args
+        self._recovery_request_tools: list[Tool] = list(tools or [])
+        self._recovery_suppressed = False
+        self._engine.recovery_tool_name_validator = self._can_recover_tool_name
+
+    def _check_skip_tool_parsing(self, request) -> None:
+        super()._check_skip_tool_parsing(request)
+        self._recovery_request_tools = list(getattr(request, "tools", None) or [])
+        self._recovery_suppressed = getattr(request, "tool_choice", None) == "none"
+
+    def _can_recover_tool_name(self, name: str) -> bool:
+        return bool(
+            name
+            and self._recovery_request_tools
+            and not self._recovery_suppressed
+            and find_tool_name(self._recovery_request_tools, name)
+        )
 
     def _convert_args(self, raw_args: str, partial: bool) -> str:
         result = _dsml_arg_converter(raw_args, partial)

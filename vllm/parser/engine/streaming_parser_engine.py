@@ -5,7 +5,7 @@ incremental lexing, and state-machine-driven semantic event emission."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from vllm.parser.engine.events import EventType, SemanticEvent
@@ -156,19 +156,26 @@ class StreamingParserEngine:
             for (state, terminal), tr in config.transitions.items()
             if tr.next_state in self._TOOL_STATES or state in self._TOOL_STATES
         )
+        # TOOL_CALL_END may close an inner call rather than its lexical wrapper,
+        # so identify exits from state transitions instead.
+        self._tool_exit_terminals: frozenset[str] = frozenset(
+            terminal
+            for (state, terminal), tr in config.transitions.items()
+            if state in self._TOOL_STATES and tr.next_state not in self._TOOL_STATES
+        )
 
         self.skip_tool_parsing = False
         # Function names declared by the request, or None when unknown.
-        # Consulted only by transitions with ``validate_tool_name``;
-        # set per request by the owning ParserEngine, like
-        # ``skip_tool_parsing`` it survives reset().
+        # Used to abort a recovery hold early when the held name can no
+        # longer become a declared tool. Survives reset() like
+        # ``skip_tool_parsing``.
         self.allowed_tool_names: frozenset[str] | None = None
-        # True when the request asked for tool_choice "none".  Recovery
-        # transitions are skipped while set, so text that looks like a
-        # recovered tool call stays plain content instead of being
-        # consumed and then suppressed.  Set per request by the owning
-        # ParserEngine; survives reset() like ``skip_tool_parsing``.
+        # True when the request asked for tool_choice "none".
         self.suppress_tool_calls = False
+        # Optional parser-owned validator used only by provisional tool-call
+        # transitions. It intentionally survives reset() so the owning
+        # ParserEngine can bind a stable callback once at construction.
+        self.recovery_tool_name_validator: Callable[[str], bool] | None = None
         self.reset(initial_state=initial_state)
 
     def _reset_args_state(self) -> None:
@@ -198,14 +205,13 @@ class StreamingParserEngine:
         self._lexer.reset()
         self._message_header_buffer = ""
         self._reset_args_state()
-        self._recovered_tool_call = False
-        self._pending_between_text = ""
-        self._hold_active = False
-        self._held_events: list[SemanticEvent] = []
-        self._held_raw: list[str] = []
-        self._held_name: list[str] = []
-        self._held_prior_state: ParserState = self.state
-        self._held_prior_tool_index: int = -1
+        self._recovery_hold_active = False
+        self._recovery_hold_events: list[SemanticEvent] = []
+        self._recovery_hold_raw = ""
+        self._recovery_hold_name = ""
+        self._recovery_prior_state = self.state
+        self._recovery_prior_tool_index = -1
+        self._recovery_outer_closer_pending = False
 
     def feed(
         self,
@@ -259,11 +265,8 @@ class StreamingParserEngine:
 
         events.extend(self._process_lex_tokens(self._lexer.flush()))
 
-        if self._hold_active:
-            # Stream ended before the recovered tool name completed:
-            # the held events never validated, so flush the raw text
-            # as content in the pre-recovery state.
-            events.extend(self._abort_hold("".join(self._held_raw)))
+        if self._recovery_hold_active:
+            events.extend(self._abort_recovery_hold())
 
         if self._args_buffer:
             events.append(
@@ -335,22 +338,36 @@ class StreamingParserEngine:
     )
 
     def _on_terminal(self, terminal: str, value: str) -> list[SemanticEvent]:
+        if (
+            self._recovery_outer_closer_pending
+            and self.state == ParserState.CONTENT
+            and terminal in self._tool_exit_terminals
+        ):
+            self._recovery_outer_closer_pending = False
+            return []
+
         key = (self.state, terminal)
         transition = self.config.transitions.get(key)
 
         if transition is None:
+            # DROP_TERMINAL must never enter provisional recovery buffers.
             if self._has_drops and terminal == DROP_TERMINAL:
                 return []
-            if self._hold_active and self.state == ParserState.TOOL_NAME:
-                # A terminal with no meaning inside a held tool name,
-                # for example a real tool call start token, ends the
-                # hold: replay the held text as content, then handle
-                # the terminal again in the restored state so it keeps
-                # its normal meaning.
-                events = self._abort_hold("".join(self._held_raw))
+            if self._recovery_hold_active and self.state == ParserState.TOOL_NAME:
+                events = self._abort_recovery_hold()
                 events.extend(self._on_terminal(terminal, value))
                 return events
+            if self._recovery_hold_active and self.state == ParserState.TOOL_ARGS:
+                # DSML parameter closers are terminals but deliberately have
+                # no state transition. During recovery they are still part of
+                # the candidate invoke and must stay buffered as arguments.
+                return self._emit_for_state(value)
             return self._emit_for_state(value)
+
+        if self.skip_tool_parsing and (
+            transition.provisional_tool_call or self._recovery_hold_active
+        ):
+            return self._apply_transition(transition, value)
 
         if self.skip_tool_parsing and terminal in self._tool_terminals:
             if self.state == ParserState.MESSAGE_HEADER:
@@ -390,23 +407,11 @@ class StreamingParserEngine:
         return self._apply_transition(transition, value)
 
     def _emit_for_state(self, text: str) -> list[SemanticEvent]:
-        if self._hold_active and self.state == ParserState.TOOL_NAME:
-            candidate = "".join(self._held_name) + text
-            if not self._can_grow_into_declared_name(candidate):
-                # The held text can no longer become a declared tool
-                # name, so holding longer would only stall streaming.
-                # Release everything consumed so far as content.
-                return self._abort_hold("".join(self._held_raw) + text)
-            self._held_raw.append(text)
-            self._held_name.append(text)
-            self._held_events.append(
-                SemanticEvent(
-                    EventType.TOOL_NAME,
-                    value=text,
-                    tool_index=self.tool_index,
-                )
-            )
-            return []
+        if self._recovery_hold_active:
+            return self._hold_recovery_text(text)
+        return self._emit_for_state_now(text)
+
+    def _emit_for_state_now(self, text: str) -> list[SemanticEvent]:
         if self.state == ParserState.MESSAGE_HEADER:
             self._message_header_buffer += text
             return []
@@ -423,24 +428,22 @@ class StreamingParserEngine:
         content_type = self.config.content_events.get(self.state)
         if content_type is not None:
             return [SemanticEvent(content_type, value=text, tool_index=self.tool_index)]
-        if self._recovered_tool_call and self.state == ParserState.TOOL_BETWEEN:
-            # A response that lost its opening wrapper usually loses the
-            # closing one too, so text after a recovered invoke is often
-            # the rest of the answer rather than padding before the next
-            # invoke.  Whitespace is held back because that is what
-            # padding looks like; as soon as anything else shows up the
-            # whole run is real output and goes out as content.
-            self._pending_between_text += text
-            if self._pending_between_text.strip():
-                held = self._pending_between_text
-                self._pending_between_text = ""
-                return [
-                    SemanticEvent(
-                        EventType.TEXT_CHUNK,
-                        value=held,
-                        tool_index=self.tool_index,
-                    )
-                ]
+        return []
+
+    def _hold_recovery_text(self, text: str) -> list[SemanticEvent]:
+        self._recovery_hold_raw += text
+
+        if self.state == ParserState.TOOL_NAME:
+            self._recovery_hold_name += text
+            # Tool names are expected to be compact. Avoid delaying an entire
+            # response if ordinary prose happens to quote an unterminated
+            # invoke marker.
+            if len(self._recovery_hold_name) > 256 or "\n" in self._recovery_hold_name:
+                return self._abort_recovery_hold()
+            if not self._can_grow_into_declared_name(self._recovery_hold_name):
+                return self._abort_recovery_hold()
+
+        self._recovery_hold_events.extend(self._emit_for_state_now(text))
         return []
 
     def _on_content(self, text: str) -> list[SemanticEvent]:
@@ -453,80 +456,115 @@ class StreamingParserEngine:
         transition: Transition,
         value: str,
     ) -> list[SemanticEvent]:
-        if self._hold_active:
-            return self._resolve_hold(transition, value)
-        if transition.validate_tool_name:
-            if self.suppress_tool_calls or self.allowed_tool_names is None:
-                # Recovery could never be accepted for this request, so
-                # the trigger text stays plain content and nothing is
-                # buffered.
+        if self._recovery_hold_active:
+            return self._advance_recovery_hold(transition, value)
+        if transition.provisional_tool_call:
+            if self.recovery_tool_name_validator is None:
                 return self._emit_for_state(value)
-            return self._begin_hold(transition, value)
+            return self._begin_recovery_hold(transition, value)
+        if (
+            self._recovery_outer_closer_pending
+            and self.state == ParserState.CONTENT
+            and transition.next_state in self._TOOL_STATES
+        ):
+            self._recovery_outer_closer_pending = False
         return self._run_transition(transition, value)
 
-    def _begin_hold(
+    def _begin_recovery_hold(
         self,
         transition: Transition,
         value: str,
     ) -> list[SemanticEvent]:
-        """Apply a ``validate_tool_name`` transition but hold its events.
-
-        The events (and every TOOL_NAME chunk that follows) stay
-        buffered until the name completes and validates, so a false
-        positive can be undone without having emitted anything.
-        """
         prior_state = self.state
         prior_tool_index = self.tool_index
-        self._held_events = self._run_transition(transition, value)
-        self._held_raw = [value]
-        self._held_name = []
-        self._held_prior_state = prior_state
-        self._held_prior_tool_index = prior_tool_index
-        self._hold_active = True
-        self._recovered_tool_call = True
+        held_events = self._run_transition(transition, value)
+        self._recovery_hold_active = True
+        self._recovery_hold_events = held_events
+        self._recovery_hold_raw = value
+        self._recovery_hold_name = ""
+        self._recovery_prior_state = prior_state
+        self._recovery_prior_tool_index = prior_tool_index
         return []
 
-    def _resolve_hold(
+    def _advance_recovery_hold(
         self,
         transition: Transition,
         value: str,
     ) -> list[SemanticEvent]:
-        """End the hold window at the name-completing transition."""
-        name = "".join(self._held_name)
-        allowed = self.allowed_tool_names
-        if allowed is not None and name in allowed:
-            events = self._held_events
-            self._clear_hold()
-            events.extend(self._run_transition(transition, value))
+        self._recovery_hold_raw += value
+
+        if self.state == ParserState.TOOL_NAME:
+            validator = self.recovery_tool_name_validator
+            if validator is None or not validator(self._recovery_hold_name):
+                return self._abort_recovery_hold()
+            self._recovery_hold_events.extend(self._run_transition(transition, value))
+            return []
+
+        if self.state == ParserState.TOOL_ARGS:
+            if not transition.commit_provisional_tool_call:
+                return self._abort_recovery_hold()
+            if self.skip_tool_parsing:
+                raw = self._recovery_hold_raw
+                prior_state = self._recovery_prior_state
+                prior_tool_index = self._recovery_prior_tool_index
+                self.state = ParserState.CONTENT
+                self.tool_index = prior_tool_index
+                self._reset_args_state()
+                self._clear_recovery_hold()
+                self._recovery_outer_closer_pending = True
+                events: list[SemanticEvent] = []
+                if prior_state == ParserState.REASONING:
+                    events.append(
+                        SemanticEvent(
+                            EventType.REASONING_END,
+                            tool_index=prior_tool_index,
+                        )
+                    )
+                events.append(
+                    SemanticEvent(
+                        EventType.TEXT_CHUNK,
+                        value=raw,
+                        tool_index=prior_tool_index,
+                    )
+                )
+                return events
+            transition_events = self._run_transition(transition, value)
+            self._recovery_hold_events.extend(transition_events)
+            events = self._recovery_hold_events
+            self._clear_recovery_hold()
+            # A recovered invoke started outside a valid outer tool wrapper.
+            # Do not leave it in TOOL_BETWEEN: subsequent text is content, and
+            # a following bare invoke must enter the provisional path again.
+            self.state = ParserState.CONTENT
+            self._recovery_outer_closer_pending = True
             return events
-        return self._abort_hold("".join(self._held_raw) + value)
 
-    def _abort_hold(self, raw: str) -> list[SemanticEvent]:
-        """Discard held events and re-emit the raw text as content."""
-        self.state = self._held_prior_state
-        self.tool_index = self._held_prior_tool_index
-        self._recovered_tool_call = self._held_prior_state in self._TOOL_STATES
-        self._clear_hold()
-        return self._emit_for_state(raw)
+        return self._abort_recovery_hold()
 
-    def _clear_hold(self) -> None:
-        self._hold_active = False
-        self._held_events = []
-        self._held_raw = []
-        self._held_name = []
+    def _abort_recovery_hold(self) -> list[SemanticEvent]:
+        raw = self._recovery_hold_raw
+        self.state = self._recovery_prior_state
+        self.tool_index = self._recovery_prior_tool_index
+        self._reset_args_state()
+        self._clear_recovery_hold()
+        return self._emit_for_state_now(raw)
+
+    def _clear_recovery_hold(self) -> None:
+        self._recovery_hold_active = False
+        self._recovery_hold_events = []
+        self._recovery_hold_raw = ""
+        self._recovery_hold_name = ""
 
     def _can_grow_into_declared_name(self, candidate: str) -> bool:
         """Return True when *candidate* is a prefix of a declared tool name.
 
-        Consulted while a recovery hold is active.  Membership in the
-        declared set is the only way a held name can validate, so once
-        the text seen so far stops being a prefix of any declared name
-        the caller aborts the hold.  This also bounds how much text a
-        hold can buffer to the length of the longest declared name.
+        Consulted while a recovery hold is active. Once the text seen so
+        far stops being a prefix of any declared name the caller aborts
+        the hold so quoted markers stream out as content promptly.
         """
         allowed = self.allowed_tool_names
         if allowed is None:
-            return False
+            return True
         return any(name.startswith(candidate) for name in allowed)
 
     def _run_transition(
@@ -552,16 +590,9 @@ class StreamingParserEngine:
             )
             self._args_buffer = ""
 
-        # Whatever is still held between invokes is whitespace padding,
-        # which the wrapped path drops too.
-        self._pending_between_text = ""
-
         if previous_state == ParserState.MESSAGE_HEADER:
             message_header = self._message_header_buffer
             self._message_header_buffer = ""
-
-        if transition.next_state not in self._TOOL_STATES:
-            self._recovered_tool_call = False
 
         self.state = transition.next_state
 
