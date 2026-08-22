@@ -1,12 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Dump DeepSeek-V4 DSpark hidden states from a running vLLM server.
+"""Dump DSpark hidden states from a running vLLM server.
 
-The server should run the normal DSpark speculative path. This script sends one
-pre-tokenized request at a time and asks the model runner to dump only the
+Sends one pre-tokenized request at a time and asks the model runner to dump
 response-context hidden-state chunks, then merges them into the SpecForge
 offline-training format.
+
+DeepSeek-V4: serve with the normal DSpark speculative path so auxiliary
+layers 40–42 are captured.
+
+GLM-5.2: there is no vLLM DSpark drafter yet. Serve the target with
+``extract_hidden_states`` so layers 75–77 are captured, then pass
+``--family glm52``:
+
+.. code-block:: bash
+
+    vllm serve /path/to/GLM-5.2-NVFP4 \\
+      --served-model-name GLM-5.2 \\
+      --trust-remote-code \\
+      --no-enable-chunked-prefill \\
+      --no-enable-prefix-caching \\
+      --speculative-config '{"method":"extract_hidden_states","num_speculative_tokens":1,"draft_model_config":{"hf_config":{"eagle_aux_hidden_state_layer_ids":[75,76,77]}}}'
+
+    python dspark_dump_hidden_states_server.py \\
+      --family glm52 \\
+      --server-url http://127.0.0.1:8000 \\
+      --model GLM-5.2 \\
+      --tokenizer-path /path/to/GLM-5.2-NVFP4 \\
+      --data-path /path/to/glm-rollouts.jsonl \\
+      --output-path /path/to/glm-hidden-states \\
+      --trust-remote-code
 """
 
 from __future__ import annotations
@@ -23,7 +47,18 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 
-ASSISTANT_MARKER = "<｜Assistant｜>"
+FAMILY_PRESETS: dict[str, dict[str, Any]] = {
+    "dsv4": {
+        "assistant_marker": "<｜Assistant｜>",
+        "hidden_size": 4096,
+        "aux_hidden_size": 12288,
+    },
+    "glm52": {
+        "assistant_marker": "<|assistant|>",
+        "hidden_size": 6144,
+        "aux_hidden_size": 18432,
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,7 +76,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=int, default=3600)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--keep-parts", action="store_true")
-    return parser.parse_args()
+    parser.add_argument(
+        "--family",
+        choices=sorted(FAMILY_PRESETS),
+        default="dsv4",
+        help="Preset assistant marker and hidden sizes. Override with the flags below.",
+    )
+    parser.add_argument(
+        "--assistant-marker",
+        default=None,
+        help="Last assistant span marker in rendered text. Defaults from --family.",
+    )
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help="Expected last-layer hidden width. Defaults from --family.",
+    )
+    parser.add_argument(
+        "--aux-hidden-size",
+        type=int,
+        default=None,
+        help="Expected concatenated aux hidden width. Defaults from --family.",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="Pass enable_thinking=False when rendering conversations.",
+    )
+    args = parser.parse_args()
+    preset = FAMILY_PRESETS[args.family]
+    if args.assistant_marker is None:
+        args.assistant_marker = preset["assistant_marker"]
+    if args.hidden_size is None:
+        args.hidden_size = preset["hidden_size"]
+    if args.aux_hidden_size is None:
+        args.aux_hidden_size = preset["aux_hidden_size"]
+    return args
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -59,21 +130,46 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def get_text(row: dict[str, Any]) -> str:
+def get_text(
+    row: dict[str, Any],
+    tokenizer: Any,
+    *,
+    disable_thinking: bool,
+) -> str:
     text = row.get("text")
-    if isinstance(text, str):
+    if isinstance(text, str) and text:
         return text
     prompt = row.get("prompt")
-    if isinstance(prompt, str):
+    if isinstance(prompt, str) and prompt:
         return prompt
-    raise ValueError("Each row must contain a string 'text' or 'prompt' field")
+    conversations = row.get("conversations")
+    if isinstance(conversations, list) and conversations:
+        kwargs: dict[str, Any] = {}
+        if disable_thinking:
+            kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+        rendered = tokenizer.apply_chat_template(
+            conversations,
+            tokenize=False,
+            add_generation_prompt=False,
+            **kwargs,
+        )
+        if not isinstance(rendered, str) or not rendered:
+            raise ValueError("apply_chat_template returned an empty conversation")
+        return rendered
+    raise ValueError(
+        "Each row must contain a non-empty 'text'/'prompt' string or 'conversations'"
+    )
 
 
-def tokenize(tokenizer, text: str) -> tuple[list[int], int, int]:
-    marker_pos = text.rfind(ASSISTANT_MARKER)
+def tokenize(
+    tokenizer,
+    text: str,
+    assistant_marker: str,
+) -> tuple[list[int], int, int]:
+    marker_pos = text.rfind(assistant_marker)
     if marker_pos < 0:
-        raise ValueError(f"Missing assistant marker: {ASSISTANT_MARKER}")
-    response_text_start = marker_pos + len(ASSISTANT_MARKER)
+        raise ValueError(f"Missing assistant marker: {assistant_marker}")
+    response_text_start = marker_pos + len(assistant_marker)
     if not text[response_text_start:].strip():
         raise ValueError("Empty assistant response")
 
@@ -206,6 +302,8 @@ def merge_direct_parts(
     save_end: int,
     response_start: int,
     row: dict[str, Any],
+    hidden_size: int,
+    aux_hidden_size: int,
 ) -> None:
     parts = sorted(
         prefix.parent.glob(prefix.name + ".part_*_*.pt"),
@@ -250,10 +348,14 @@ def merge_direct_parts(
             "aux_hidden_state length mismatch: "
             f"{aux_hidden_state.shape} vs {input_ids.numel()}"
         )
-    if hidden_state.shape[-1] != 4096:
-        raise ValueError(f"Expected final hidden size 4096, got {hidden_state.shape}")
-    if aux_hidden_state.shape[-1] != 12288:
-        raise ValueError(f"Expected aux hidden size 12288, got {aux_hidden_state.shape}")
+    if hidden_state.shape[-1] != hidden_size:
+        raise ValueError(
+            f"Expected final hidden size {hidden_size}, got {hidden_state.shape}"
+        )
+    if aux_hidden_state.shape[-1] != aux_hidden_size:
+        raise ValueError(
+            f"Expected aux hidden size {aux_hidden_size}, got {aux_hidden_state.shape}"
+        )
     expected_loss_tokens = max(save_end - max(response_start, save_start), 0)
     if int(loss_mask.sum().item()) != expected_loss_tokens:
         raise ValueError(
@@ -315,8 +417,16 @@ def main() -> None:
         if ckpt_path.exists():
             continue
 
-        text = get_text(row)
-        input_ids, response_start, response_end = tokenize(tokenizer, text)
+        text = get_text(
+            row,
+            tokenizer,
+            disable_thinking=args.disable_thinking,
+        )
+        input_ids, response_start, response_end = tokenize(
+            tokenizer,
+            text,
+            args.assistant_marker,
+        )
         input_ids, response_start, response_end = truncate_left(
             input_ids,
             response_start,
@@ -353,6 +463,8 @@ def main() -> None:
             save_end=save_end,
             response_start=response_start,
             row=row,
+            hidden_size=args.hidden_size,
+            aux_hidden_size=args.aux_hidden_size,
         )
 
 
