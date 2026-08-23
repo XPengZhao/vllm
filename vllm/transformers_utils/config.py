@@ -89,6 +89,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     deepseek_v4="DeepseekV4Config",
     dots3_note="Dots3NoteConfig",
     k3_dspark="K3DSparkConfig",
+    glm52_dspark="Glm52DSparkConfig",
     flex_olmo="FlexOlmoConfig",
     fireredlid="FireRedLIDConfig",
     funaudiochat="FunAudioChatConfig",
@@ -151,6 +152,7 @@ _PATCH_HF_VALIDATE_ROPE: set[str] = {"sarvam_mla"}
 # `deepseek_sparse_attention`). Extend the allowed set for these model types.
 _PATCH_HF_ALLOWED_LAYER_TYPES: dict[str, tuple[str, ...]] = {
     "glm_moe_dsa": ("deepseek_sparse_attention",),
+    "glm52_dspark": ("deepseek_sparse_attention",),
 }
 
 _CONFIG_ATTRS_MAPPING: dict[str, str] = {

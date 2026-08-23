@@ -95,7 +95,12 @@ from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    get_kv_quant_mode,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
@@ -134,6 +139,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         aux_stream: torch.cuda.Stream | None = None,
         use_rope: bool = False,
         non_causal_multi_token_decode: bool = False,
+        sliding_window: int | None = None,
         run_gemm_rs_ar: bool = False,
     ) -> None:
         super().__init__()
@@ -145,6 +151,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.non_causal_multi_token_decode = non_causal_multi_token_decode
+        self.sliding_window = sliding_window
         # Latent "head" seen by the attention kernel / KV cache.
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.scale = self.qk_head_dim**-0.5
@@ -391,8 +398,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # TODO: Remove this mypy workaround once the K3 PR is fully merged.
-        return MLAAttentionSpec(  # type: ignore[call-arg]
+        common_kwargs = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
@@ -401,6 +407,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             # fp8_ds_mla: 656-byte custom layout; see flashmla_sparse.py.
             state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
+        )
+        if self.sliding_window is not None:
+            return SlidingWindowMLASpec(  # type: ignore[call-arg]
+                **common_kwargs,
+                sliding_window=self.sliding_window,
+            )
+        # TODO: Remove this mypy workaround once the K3 PR is fully merged.
+        return MLAAttentionSpec(  # type: ignore[call-arg]
+            **common_kwargs,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 

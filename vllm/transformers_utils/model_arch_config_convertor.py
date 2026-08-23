@@ -320,6 +320,7 @@ class ModelArchConfigConvertorBase:
             "dots3_note",
             "deepseek_mtp",
             "k3_dspark",
+            "glm52_dspark",
             "glm_moe_dsa",
             "glm4_moe_lite",
             "glm4_moe_lite_mtp",
