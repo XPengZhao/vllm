@@ -1015,6 +1015,8 @@ def _pool_bytes_per_block(
     if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
         return block_stride
+    if extra_bytes := _bytes_per_block_uniform_plus_disjoint(kv_cache_groups):
+        return extra_bytes
     group_size = max(len(g.layer_names) for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
     return page_size * group_size
@@ -1343,6 +1345,75 @@ def _use_packed_kv_cache_config(
     return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
 
 
+def _is_uniform_type_plus_disjoint_groups(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    """True for UniformType target + non-UniformType extra groups (GLM DSpark).
+
+    The extra groups must not be UniformTypeKVCacheSpecs: that combination is
+    the DeepSeek-V4 packed overlay path.
+    """
+    if len(kv_cache_groups) < 2:
+        return False
+    if not isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
+        return False
+    return not any(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups[1:]
+    )
+
+
+def _bytes_per_block_uniform_plus_disjoint(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int | None:
+    """Per-block bytes when target UniformType tensors sit beside extra groups."""
+    if not _is_uniform_type_plus_disjoint_groups(kv_cache_groups):
+        return None
+    uniform = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+    extra = sum(
+        group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+        for group in kv_cache_groups[1:]
+    )
+    return uniform.page_size_bytes + extra
+
+
+def _try_get_mla_plus_swa_mla_disjoint_groups(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Full MLA target + SlidingWindowMLA draft without packed overlay.
+
+    GLM-5.2 DSpark trains SWA=128. FlashMLA kernels do not apply a window, so
+    serving must keep SlidingWindowMLASpec (hybrid manager drops tokens outside
+    the window). Target GLM uses mixed-page UniformType (fp8_ds_mla + indexer);
+    wrapping the draft as a second UniformType group would enable DeepSeek-V4
+    packed overlay and alias draft pages onto target KV.
+    """
+    if any(isinstance(spec, HiddenStateCacheSpec) for spec in kv_cache_spec.values()):
+        return None
+
+    swa_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, SlidingWindowMLASpec)
+    }
+    rest = {
+        name: spec for name, spec in kv_cache_spec.items() if name not in swa_specs
+    }
+    if not swa_specs or not rest:
+        return None
+    rest_uniform = UniformTypeKVCacheSpecs.from_specs(rest)
+    if rest_uniform is None:
+        return None
+    try:
+        swa_merged = next(iter(swa_specs.values())).merge(list(swa_specs.values()))
+    except (AssertionError, ValueError):
+        return None
+    return [
+        KVCacheGroupSpec(list(rest.keys()), rest_uniform),
+        KVCacheGroupSpec(list(swa_specs.keys()), swa_merged),
+    ]
+
+
 def _get_kv_cache_config_packed(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1427,6 +1498,28 @@ def get_kv_cache_config_from_groups(
         num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
             vllm_config, kv_cache_groups, available_memory
         )
+    elif bytes_per_block := _bytes_per_block_uniform_plus_disjoint(kv_cache_groups):
+        # GLM-5.2 DSpark: UniformType target (mixed page sizes, per-layer
+        # tensors) plus a SlidingWindowMLA draft group. Dedicated tensors,
+        # no packed overlay.
+        num_blocks = may_override_num_blocks(
+            vllm_config, available_memory // bytes_per_block
+        )
+        uniform = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+        per_layer_specs = uniform.kv_cache_specs
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=per_layer_specs[layer_name].page_size_bytes * num_blocks,
+                shared_by=[layer_name],
+            )
+            for layer_name in kv_cache_groups[0].layer_names
+        ]
+        for group in kv_cache_groups[1:]:
+            page_size = group.kv_cache_spec.page_size_bytes
+            for layer_name in group.layer_names:
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=page_size * num_blocks, shared_by=[layer_name])
+                )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1604,9 +1697,21 @@ def group_and_unify_kv_cache_specs(
     """
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
     Currently, this is only used for DeepseekV4.
+
+    Must not run for non-DeepSeek-V4 mixes (e.g. GLM fp8_ds_mla target + a
+    SlidingWindowMLA draft): the multi-group packed allocator overlays group
+    layouts in one slab, so draft pages would alias target MLA/indexer cache.
     """
     if not any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
+    ):
+        return None
+
+    # DeepSeek-V4 SWA/MLA hybrid only. Speculative drafts on other MLA models
+    # (GLM-5.2 DSpark, etc.) must not enter this path.
+    if not any(
+        getattr(spec, "model_version", None) == "deepseek_v4"
+        for spec in kv_cache_spec.values()
     ):
         return None
 
@@ -1833,6 +1938,8 @@ def get_kv_cache_groups(
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
+    elif disjoint := _try_get_mla_plus_swa_mla_disjoint_groups(kv_cache_spec):
+        return disjoint
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.
@@ -1979,6 +2086,18 @@ def _max_memory_usage_bytes_from_groups(
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
+
+    if _is_uniform_type_plus_disjoint_groups(kv_cache_groups):
+        uniform = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+        total = sum(
+            spec.max_memory_usage_bytes(vllm_config)
+            for spec in uniform.kv_cache_specs.values()
+        )
+        for group in kv_cache_groups[1:]:
+            total += group.kv_cache_spec.max_memory_usage_bytes(vllm_config) * len(
+                group.layer_names
+            )
+        return total
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len

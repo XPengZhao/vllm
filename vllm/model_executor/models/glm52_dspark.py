@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 import vllm._custom_ops as ops
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -42,6 +42,14 @@ def _num_draft_layers(config) -> int:
     if method.get("num_layers") is not None:
         return int(method["num_layers"])
     return int(config.num_hidden_layers)
+
+
+def _draft_cache_config(vllm_config: VllmConfig):
+    """K3 dense MLA cannot use GLM's packed ``fp8_ds_mla`` KV layout."""
+    cache_config = vllm_config.cache_config
+    if cache_config is not None and cache_config.cache_dtype == "fp8_ds_mla":
+        return replace(cache_config, cache_dtype="auto")
+    return cache_config
 
 
 def _num_target_layers(config) -> int:
@@ -115,6 +123,10 @@ class Glm52DSparkDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         quant_config = get_draft_quant_config(vllm_config)
+        # Train–serve SWA: FlashMLA kernels reject sliding_window, so the
+        # window is enforced by SlidingWindowMLASpec (only the last N tokens
+        # stay in the draft KV group). Do not fold that spec into DeepSeek-V4
+        # packed overlay; get_kv_cache_groups keeps a disjoint SWA group.
         sliding_window = int(getattr(config, "sliding_window", 128) or 128)
         self.self_attn = MultiHeadLatentAttention(
             config=config,
@@ -125,7 +137,7 @@ class Glm52DSparkDecoderLayer(nn.Module):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
-            cache_config=vllm_config.cache_config,
+            cache_config=_draft_cache_config(vllm_config),
             quant_config=quant_config,
             prefix=maybe_prefix(
                 prefix, f"layers.{start_layer_id + layer_idx}.self_attn"

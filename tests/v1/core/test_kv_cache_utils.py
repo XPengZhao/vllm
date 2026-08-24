@@ -34,6 +34,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_capacity,
     get_kv_cache_configs,
     get_kv_cache_groups,
+    get_kv_cache_config_from_groups,
     get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     group_and_unify_kv_cache_specs,
@@ -2188,7 +2189,7 @@ def test_mixed_precision_kv_cache_with_uniform_type_specs():
     assert scheduler_config.needs_kv_cache_zeroing
 
 
-def new_mla_spec(cache_dtype_str=None, block_size=16):
+def new_mla_spec(cache_dtype_str=None, block_size=16, model_version=None):
     # head_size = kv_lora_rank(512) + qk_rope_head_dim(64) = 576
     return MLAAttentionSpec(
         block_size=block_size,
@@ -2196,16 +2197,18 @@ def new_mla_spec(cache_dtype_str=None, block_size=16):
         head_size=576,
         dtype=torch.float32,
         cache_dtype_str=cache_dtype_str,
+        model_version=model_version,
     )
 
 
-def new_swa_mla_spec(head_size=576, sliding_window=128):
+def new_swa_mla_spec(head_size=576, sliding_window=128, model_version=None):
     return SlidingWindowMLASpec(
         block_size=16,
         num_kv_heads=1,
         head_size=head_size,
         dtype=torch.float32,
         sliding_window=sliding_window,
+        model_version=model_version,
     )
 
 
@@ -2226,13 +2229,24 @@ def test_group_and_unify_kv_cache_specs_uniform_page_size_returns_none():
     assert group_and_unify_kv_cache_specs(specs) is None
 
 
-def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
-    # DeepseekV4-style: differing page sizes across MLA and sliding-window MLA
-    # layers do require tuple packing, so grouping must still be produced.
+def test_group_and_unify_kv_cache_specs_non_dsv4_mixed_page_size_returns_none():
+    # GLM-5.2 + DSpark style: target MLA + SlidingWindowMLA draft with
+    # different page sizes, but not DeepSeek-V4. Must not take the multi-group
+    # packed path (overlapping slabs corrupt target KV).
     mla_spec = new_mla_spec()
     swa_spec = new_swa_mla_spec(head_size=1024)
     assert mla_spec.page_size_bytes != swa_spec.page_size_bytes
-    specs = {"mla.0": mla_spec, "mla.1": new_mla_spec(), "swa.0": swa_spec}
+    specs = {"mla.0": mla_spec, "swa.0": swa_spec}
+    assert group_and_unify_kv_cache_specs(specs) is None
+
+
+def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
+    # DeepseekV4-style: differing page sizes across MLA and sliding-window MLA
+    # layers do require tuple packing, so grouping must still be produced.
+    mla_spec = new_mla_spec(model_version="deepseek_v4")
+    swa_spec = new_swa_mla_spec(head_size=1024, model_version="deepseek_v4")
+    assert mla_spec.page_size_bytes != swa_spec.page_size_bytes
+    specs = {"mla.0": mla_spec, "mla.1": new_mla_spec(model_version="deepseek_v4"), "swa.0": swa_spec}
     grouped = group_and_unify_kv_cache_specs(specs)
     assert grouped is not None
     # One MLA group plus one sliding-window MLA group.
@@ -2358,6 +2372,69 @@ def test_mla_with_incompatible_swa_uses_one_full_allocation_group(caplog_vllm):
     assert promoted_draft.sliding_window == draft.sliding_window
     assert specs["draft.0"] is draft
     assert "attention compute is unchanged" in caplog_vllm.text
+
+
+def test_glm_dspark_swa_uses_disjoint_groups_not_packed():
+    # GLM-5.2 DSpark: mixed-page target MLA + indexer + SlidingWindowMLA draft.
+    # Must keep a UniformType target group and a separate SWA group, never the
+    # DeepSeek-V4 packed overlay.
+    specs = {
+        "mla.0": new_mla_spec(),
+        "indexer.0": new_indexer_mla_spec(),
+        "swa.0": new_swa_mla_spec(head_size=1024),
+    }
+    assert len({spec.page_size_bytes for spec in specs.values()}) == 3
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    assert len(groups) == 2
+    assert isinstance(groups[0].kv_cache_spec, UniformTypeKVCacheSpecs)
+    assert set(groups[0].layer_names) == {"mla.0", "indexer.0"}
+    assert isinstance(groups[1].kv_cache_spec, SlidingWindowMLASpec)
+    assert groups[1].layer_names == ["swa.0"]
+    assert groups[1].kv_cache_spec.sliding_window == 128
+
+
+def test_glm_dspark_swa_allocates_disjoint_tensors():
+    from unittest.mock import MagicMock
+
+    specs = {
+        "mla.0": new_mla_spec(),
+        "indexer.0": new_indexer_mla_spec(),
+        "swa.0": new_swa_mla_spec(head_size=1024),
+    }
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    bytes_per_block = sum(spec.page_size_bytes for spec in specs.values())
+    num_blocks = 8
+    vllm_config = MagicMock()
+    vllm_config.cache_config.num_gpu_blocks_override = None
+    vllm_config.cache_config.prefix_cache_retention_interval = 0
+    vllm_config.kv_transfer_config = None
+
+    kv_config = get_kv_cache_config_from_groups(
+        vllm_config, groups, bytes_per_block * num_blocks
+    )
+    assert kv_config.num_blocks == num_blocks
+    shared = [tuple(tensor.shared_by) for tensor in kv_config.kv_cache_tensors]
+    assert all(len(names) == 1 for names in shared)
+    assert {names[0] for names in shared} == set(specs)
+    assert all(
+        tensor.offset == 0 and tensor.block_stride == 0
+        for tensor in kv_config.kv_cache_tensors
+    )
+
+
+def test_sliding_window_mla_spec_merge_keeps_non_causal_flag():
+    spec = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float32,
+        sliding_window=128,
+        non_causal_multi_token_decode=True,
+    )
+    merged = SlidingWindowMLASpec.merge([spec, spec])
+    assert merged.non_causal_multi_token_decode
+    assert merged.sliding_window == 128
 
 
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():

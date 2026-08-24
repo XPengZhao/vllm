@@ -600,6 +600,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    # Marks draft groups that flatten a non-causal query block into decode rows.
+    # Same meaning as MLAAttentionSpec.non_causal_multi_token_decode; carried
+    # here so SWA MLA drafts (e.g. GLM-5.2 DSpark) keep DSpark decode metadata.
+    non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
 
@@ -652,6 +656,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
 
     def is_uniform_with_collection(

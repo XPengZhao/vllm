@@ -412,6 +412,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             return SlidingWindowMLASpec(  # type: ignore[call-arg]
                 **common_kwargs,
                 sliding_window=self.sliding_window,
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
             )
         # TODO: Remove this mypy workaround once the K3 PR is fully merged.
         return MLAAttentionSpec(  # type: ignore[call-arg]
