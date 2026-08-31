@@ -274,12 +274,14 @@ class DeepseekV32Model(torch.nn.Module):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            if idx in self.aux_hidden_state_layers:
+            hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
+            attn_in = None
+            # Same fencepost as DeepSeek-V4 DSpark: target_layer_ids=[ℓ]
+            # maps to aux id ℓ+1, captured after layer ℓ returns.
+            if idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(
                     hidden_states if residual is None else hidden_states + residual
                 )
-            hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
-            attn_in = None
 
         if not get_pp_group().is_last_rank:
             assert not self.use_sequence_parallel, (
