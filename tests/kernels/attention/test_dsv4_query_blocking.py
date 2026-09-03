@@ -566,7 +566,7 @@ def test_blocked_decode_kernel_matches_the_per_query_kernel(
             out.stride(0), out.stride(1), part_m.stride(0), part_m.stride(1),
             part_acc.stride(0), part_acc.stride(1), part_acc.stride(2),
             heads,
-            HAS_ATTN_SINK=True, COMB_DIM=dim, BLOCK_H=1,
+            HAS_ATTN_SINK=True, ADAPTIVE_SPLITS=False, COMB_DIM=dim, BLOCK_H=1,
             NUM_SPLITS=num_splits, SPLITS_PAD=num_splits, num_warps=4,
         )  # fmt: skip
         return out

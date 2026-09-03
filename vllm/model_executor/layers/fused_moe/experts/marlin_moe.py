@@ -3,7 +3,7 @@
 """Fused MoE utilities for GPTQ."""
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 
@@ -55,6 +55,54 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+BLOCK_SIZE_M_LADDER = (8, 16, 32, 48, 64)
+ADAPTIVE_BLOCK_SIZE_M_CANDIDATES = (48, 64)
+ADAPTIVE_BLOCK_SIZE_M_MIN_TOKENS = 512
+
+
+def _ladder_block_size_m(m: int, topk: int, num_experts: int) -> int:
+    """Smallest ladder rung the average expert load fits in."""
+    block_size_m = BLOCK_SIZE_M_LADDER[-1]
+    for block_size_m in BLOCK_SIZE_M_LADDER:
+        if m * topk / num_experts / block_size_m < 0.9:
+            break
+    return block_size_m
+
+
+def moe_padded_rows(
+    topk_ids: torch.Tensor,
+    global_num_experts: int,
+    block_sizes: tuple[int, ...],
+) -> torch.Tensor:
+    """MMA rows the expert GEMM runs at each of ``block_sizes``."""
+    hist = torch.bincount(topk_ids.flatten() + 1, minlength=global_num_experts + 1)
+    counts = hist[1:]
+    b = torch.tensor(block_sizes, device=counts.device, dtype=counts.dtype)
+    return (((counts[:, None] + b - 1) // b) * b).sum(0)
+
+
+def select_block_size_m(
+    m: int,
+    topk: int,
+    num_experts: int,
+    padded_rows: Sequence[int] | None = None,
+) -> int:
+    """Pick block_size_m for one expert call.
+
+    ``padded_rows`` is unused by ``fused_marlin_moe`` (host sync is more
+    expensive than the 48-vs-64 win). Tests and callers that already synced
+    can pass it to refine the top rung.
+    """
+    block_size_m = _ladder_block_size_m(m, topk, num_experts)
+    if (
+        padded_rows is None
+        or block_size_m != ADAPTIVE_BLOCK_SIZE_M_CANDIDATES[-1]
+        or m < ADAPTIVE_BLOCK_SIZE_M_MIN_TOKENS
+    ):
+        return block_size_m
+    smaller, larger = ADAPTIVE_BLOCK_SIZE_M_CANDIDATES
+    return smaller if padded_rows[0] < padded_rows[1] else larger
 
 
 def _fused_marlin_moe(
@@ -330,10 +378,7 @@ def fused_marlin_moe(
         M = math.ceil(M * E / global_num_experts)
 
     # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    block_size_m = select_block_size_m(M, topk, E)
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
@@ -588,6 +633,7 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             or quant_config.use_int8_w8a16
             or quant_config.use_fp8_w8a16
         ), "Supports only {mxfp,nvfp,int}4_w4a16, int8_w8a16 or fp8_w8a16"
+        self._marlin_workspace: torch.Tensor | None = None
         self.w13_g_idx = w13_g_idx
         self.w2_g_idx = w2_g_idx
         self.w13_g_idx_sort_indices = w13_g_idx_sort_indices
@@ -601,6 +647,19 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+
+    def marlin_workspace(self, device: torch.device) -> torch.Tensor:
+        """Workspace shared by every expert call on this device.
+
+        Allocated on first use rather than in ``__init__`` because the device
+        is not known until a forward arrives. First use is a warmup forward,
+        so the address is fixed before any CUDA graph captures it.
+        """
+        ws = self._marlin_workspace
+        if ws is None or ws.device != device:
+            ws = marlin_make_workspace_new(device, 4)
+            self._marlin_workspace = ws
+        return ws
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -792,6 +851,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 sort_indices2=self.w2_g_idx_sort_indices,
                 is_k_full=self.is_k_full,
                 input_dtype=self.input_dtype,
+                workspace=self.marlin_workspace(hidden_states.device),
             )
             return
 
@@ -907,6 +967,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
+            workspace=self.marlin_workspace(hidden_states.device),
         )
 
     def moe_sum(
@@ -1048,4 +1109,5 @@ class BatchedMarlinExperts(MarlinExpertsBase):
             is_k_full=self.is_k_full,
             activation_func=activation_func,
             activation_config=self.activation_config,
+            workspace=self.marlin_workspace(hidden_states.device),
         )

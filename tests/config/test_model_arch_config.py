@@ -489,6 +489,14 @@ def test_deepseek_v4_convertor_splits_vision_architecture():
     assert conv.get_architectures() == ["DeepseekV4ForConditionalGeneration"]
     assert vl_cfg.architectures == ["DeepseekV4ForConditionalGeneration"]
 
+    # Transformers / some loaders store architectures as a tuple, which
+    # fails a list equality check.
+    vl_tuple_cfg = DeepseekV4Config(vision_n_layers=32)
+    vl_tuple_cfg.architectures = ("DeepseekV4ForCausalLM",)
+    conv = DeepseekV4ModelArchConfigConvertor(vl_tuple_cfg, vl_tuple_cfg)
+    assert conv.get_architectures() == ["DeepseekV4ForConditionalGeneration"]
+    assert vl_tuple_cfg.architectures == ["DeepseekV4ForConditionalGeneration"]
+
     # Speculative-draft configs (set by SpeculativeConfig.hf_config_override)
     # keep their own architecture even with a vision tower in the config.
     for draft_arch in ("DSparkDraftModel", "DeepSeekV4MTPModel"):

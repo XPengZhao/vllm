@@ -1052,11 +1052,30 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
-    Without an explicit backend, SM12 defaults to FlashInfer while the other
-    CUDA arches keep the FlashMLA path.
+    Without an explicit backend, SM8x uses the Triton sparse-MLA path, SM12
+    defaults to FlashInfer, and the other CUDA arches keep the FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if device_capability is not None and device_capability.major == 8:
+        if (
+            backend is not None
+            and backend != AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4
+        ):
+            raise ValueError(
+                f"{backend.name} is not supported for DeepSeek V4 on SM8x; "
+                "use TRITON_MLA_SPARSE_DSV4 (default)."
+            )
+        if vllm_config.attention_config.use_fp4_indexer_cache:
+            raise ValueError(
+                "attention_config.use_fp4_indexer_cache requires SM100; "
+                "the MXFP4 indexer kernels emit Blackwell-only PTX."
+            )
+        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+            DeepseekV4AmpereMLAAttention,
+        )
+
+        return DeepseekV4AmpereMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
@@ -1764,6 +1783,21 @@ class DeepseekV4ForCausalLM(
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        # Vision-Exp shares the text Flash architecture string. If the
+        # convertor did not rewrite it, fail before loading 100+ GiB of
+        # weights into a class that has no ``aligner`` / ``vision`` modules.
+        if getattr(config, "vision_n_layers", 0) > 0 and not getattr(
+            config, "_dsv4_vl_inner", False
+        ):
+            raise ValueError(
+                "DeepSeek-V4 checkpoint has a vision tower "
+                f"(vision_n_layers={config.vision_n_layers}) but was "
+                "resolved as DeepseekV4ForCausalLM. Vision-Exp must use "
+                "DeepseekV4ForConditionalGeneration. Workaround: "
+                "--hf-overrides "
+                '\'{"architectures": '
+                '["DeepseekV4ForConditionalGeneration"]}\'.'
+            )
         expert_dtype = getattr(config, "expert_dtype", "fp4")
         if expert_dtype != "fp4":
             self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
@@ -1841,7 +1875,21 @@ class DeepseekV4ForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        try:
+            loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        except ValueError as e:
+            msg = str(e)
+            if "named 'aligner'" in msg or "named 'vision'" in msg:
+                raise ValueError(
+                    "This DeepSeek-V4 checkpoint includes a vision tower "
+                    "(aligner/vision weights) but was loaded as "
+                    "DeepseekV4ForCausalLM. Vision-Exp must use "
+                    "DeepseekV4ForConditionalGeneration. Workaround: "
+                    "--hf-overrides "
+                    '\'{"architectures": '
+                    '["DeepseekV4ForConditionalGeneration"]}\'.'
+                ) from e
+            raise
         self.process_weights_after_loading()
         return loaded_params
 

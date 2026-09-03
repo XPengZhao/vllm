@@ -185,6 +185,25 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    VLLM_MHC_FIXED_NUM_SPLIT: int = 0
+    VLLM_MHC_POST_FUSE_SQRSUM: bool = False
+    VLLM_MHC_PRENORM_SHARD: bool = True
+    VLLM_MHC_AR_INT8: bool = False
+    VLLM_UNREPLICATE_ATTN_GEMMS: bool = True
+    VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS: bool = True
+    VLLM_INDEXER_QUERY_SHARD: bool = True
+    VLLM_INDEXER_DECODE_SHARD_MIN_REQS: int = 4
+    VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
+    VLLM_INDEXER_LOGITS_MAXNREG: int = 0
+    VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
+    VLLM_INDEXER_PAGED_Q_BF16: bool = True
+    VLLM_SPARSE_PREFILL_EXACT_TILE: bool = True
+    VLLM_SPARSE_RAGGED_FAST_SCAN: bool = True
+    VLLM_SPARSE_DECODE_MAXNREG: int = 0
+    VLLM_SPARSE_DENSE_QUERY_BLOCK: int = -1
+    VLLM_SPARSE_DENSE_QUERY_BLOCK_DECODE: int = -1
+    VLLM_MARLIN_FP8_DEQUANT_BF16: bool = False
+    VLLM_MARLIN_FP8_DEQUANT_EXCLUDE: str = ""
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -1523,6 +1542,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    ),
+    # Pin the mHC TileLang GEMM split-k factor. 0 keeps the adaptive heuristic.
+    "VLLM_MHC_FIXED_NUM_SPLIT": lambda: int(
+        os.environ.get("VLLM_MHC_FIXED_NUM_SPLIT", "0")
+    ),
+    "VLLM_MHC_POST_FUSE_SQRSUM": lambda: (
+        os.environ.get("VLLM_MHC_POST_FUSE_SQRSUM", "0") == "1"
+    ),
+    "VLLM_MHC_PRENORM_SHARD": lambda: (
+        os.environ.get("VLLM_MHC_PRENORM_SHARD", "1") == "1"
+    ),
+    "VLLM_MHC_AR_INT8": lambda: os.environ.get("VLLM_MHC_AR_INT8", "0") == "1",
+    "VLLM_UNREPLICATE_ATTN_GEMMS": lambda: (
+        os.environ.get("VLLM_UNREPLICATE_ATTN_GEMMS", "1") == "1"
+    ),
+    "VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS": lambda: (
+        os.environ.get("VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS", "1") == "1"
+    ),
+    "VLLM_INDEXER_QUERY_SHARD": lambda: (
+        os.environ.get("VLLM_INDEXER_QUERY_SHARD", "1") == "1"
+    ),
+    "VLLM_INDEXER_DECODE_SHARD_MIN_REQS": lambda: int(
+        os.environ.get("VLLM_INDEXER_DECODE_SHARD_MIN_REQS", "4")
+    ),
+    "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
+        os.environ.get("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
+    ),
+    "VLLM_INDEXER_LOGITS_MAXNREG": lambda: int(
+        os.environ.get("VLLM_INDEXER_LOGITS_MAXNREG", "0")
+    ),
+    "VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M": lambda: int(
+        os.environ.get("VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M", "0")
+    ),
+    "VLLM_INDEXER_PAGED_Q_BF16": lambda: (
+        os.environ.get("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
+    ),
+    "VLLM_SPARSE_PREFILL_EXACT_TILE": lambda: (
+        os.environ.get("VLLM_SPARSE_PREFILL_EXACT_TILE", "1") == "1"
+    ),
+    "VLLM_SPARSE_RAGGED_FAST_SCAN": lambda: (
+        os.environ.get("VLLM_SPARSE_RAGGED_FAST_SCAN", "1") == "1"
+    ),
+    "VLLM_SPARSE_DECODE_MAXNREG": lambda: int(
+        os.environ.get("VLLM_SPARSE_DECODE_MAXNREG", "0")
+    ),
+    "VLLM_SPARSE_DENSE_QUERY_BLOCK": lambda: int(
+        os.environ.get("VLLM_SPARSE_DENSE_QUERY_BLOCK", "-1")
+    ),
+    "VLLM_SPARSE_DENSE_QUERY_BLOCK_DECODE": lambda: int(
+        os.environ.get("VLLM_SPARSE_DENSE_QUERY_BLOCK_DECODE", "-1")
+    ),
+    "VLLM_MARLIN_FP8_DEQUANT_BF16": lambda: (
+        os.environ.get("VLLM_MARLIN_FP8_DEQUANT_BF16", "0") == "1"
+    ),
+    "VLLM_MARLIN_FP8_DEQUANT_EXCLUDE": lambda: os.environ.get(
+        "VLLM_MARLIN_FP8_DEQUANT_EXCLUDE", ""
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(

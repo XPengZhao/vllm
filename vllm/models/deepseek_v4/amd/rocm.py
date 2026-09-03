@@ -31,10 +31,13 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    build_query_blocks,
     build_ragged_indices_from_dense,
+    prefill_query_block_size,
     rocm_inv_rope_einsum,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
+    rocm_sparse_attn_prefill_blocked,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -324,6 +327,24 @@ def compute_global_topk_ragged_indices_and_indptr(
     return global_topk_ragged, topk_indptr, topk_lens
 
 
+def uniform_decode_group_size(
+    causal: bool,
+    num_decodes: int,
+    num_decode_tokens: int,
+    query_start_loc_cpu: torch.Tensor | None,
+) -> int:
+    """Query tokens per decode request, or 0 if the step is not blockable."""
+    if not causal or num_decodes <= 0 or query_start_loc_cpu is None:
+        return 0
+    if num_decode_tokens % num_decodes:
+        return 0
+    group = num_decode_tokens // num_decodes
+    if group < 2:
+        return 0
+    lens = query_start_loc_cpu[1 : num_decodes + 1] - query_start_loc_cpu[:num_decodes]
+    return group if bool((lens == group).all()) else 0
+
+
 def _copy_ragged_to_graph_buffers(
     ragged_indices: torch.Tensor,
     ragged_indptr: torch.Tensor,
@@ -365,6 +386,9 @@ class DeepseekV4ROCMAiterMLASparseMetadata(DeepseekV4FlashMLAMetadata):
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
     decode_swa_ragged_indptr: torch.Tensor | None = None
+    # Query tokens per decode request when every request has the same count and
+    # the step is causal; 0 otherwise. See `uniform_decode_group_size`.
+    decode_query_group_size: int = 0
 
 
 class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
@@ -495,6 +519,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             **vars(base),
             decode_swa_ragged_indices=ragged_indices,
             decode_swa_ragged_indptr=ragged_indptr,
+            decode_query_group_size=uniform_decode_group_size(
+                common_attn_metadata.causal,
+                base.num_decodes,
+                base.num_decode_tokens,
+                base.query_start_loc_cpu,
+            ),
         )
 
 
@@ -932,6 +962,15 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             self.PREFILL_CHUNK_SIZE
         )
 
+        # Ratio-128 layers have no indexer: their index list is the positional
+        # identity prefix plus the SWA window, so a query block can share a KV
+        # tile. Ratio-4 top-k sets are per-query selections.
+        block_m = (
+            prefill_query_block_size(q.shape[1], q.shape[2])
+            if not swa_only and self.compress_ratio == 128
+            else 0
+        )
+
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
             ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
@@ -974,6 +1013,37 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             query_end = (
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
+
+            if block_m:
+                chunk_qsl = query_start_loc_cpu[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ]
+                chunk_qsl = chunk_qsl - chunk_qsl[0]
+                blocks = build_query_blocks(chunk_qsl, block_m, q.device)
+                rocm_sparse_attn_prefill_blocked(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    block_req=blocks[0],
+                    block_qstart=blocks[1],
+                    query_start_loc=chunk_qsl.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    scale=self.scale,
+                    head_dim=self.head_dim,
+                    nope_head_dim=self.nope_head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    attn_sink=self.attn_sink,
+                    top_k=top_k,
+                    row_stride=M,
+                    swa_offset=N,
+                    compress_ratio=self.compress_ratio,
+                    window_size=self.window_size,
+                    block_m=block_m,
+                    output=output[query_start:query_end],
+                )
+                continue
 
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],

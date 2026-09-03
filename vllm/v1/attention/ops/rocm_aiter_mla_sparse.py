@@ -15,9 +15,15 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.fp8_sm80 import (
+    _decode_fp8_f32,
+    _decode_fp8_lut,
+    get_e4m3fn_bf16_lut,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
@@ -1375,6 +1381,7 @@ def _sparse_attn_prefill_ragged_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    EXACT_TILE: tl.constexpr = False,
 ):
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -1384,14 +1391,19 @@ def _sparse_attn_prefill_ragged_kernel(
     head_mask = head_offsets < num_heads
     dim_mask = dim_offsets < head_dim
 
-    q = tl.load(
+    q_ptrs = (
         q_ptr
         + query_idx * q_stride_t
         + head_offsets[:, None] * q_stride_h
-        + dim_offsets[None, :] * q_stride_d,
-        mask=head_mask[:, None] & dim_mask[None, :],
-        other=0.0,
+        + dim_offsets[None, :] * q_stride_d
     )
+    if EXACT_TILE:
+        # The tile covers the data exactly (num_heads == BLOCK_H and
+        # head_dim == BLOCK_D), so every head/dim mask is all-true and only
+        # costs predication on the kernel's hottest instructions.
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=head_mask[:, None] & dim_mask[None, :], other=0.0)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
@@ -1412,13 +1424,15 @@ def _sparse_attn_prefill_ragged_kernel(
         valid = in_range & (slot >= 0) & (slot < num_kv)
         safe_slot = tl.where(valid, slot, 0)
 
-        kv = tl.load(
+        kv_ptrs = (
             kv_ptr
             + safe_slot[:, None] * kv_stride_n
-            + dim_offsets[None, :] * kv_stride_d,
-            mask=valid[:, None] & dim_mask[None, :],
-            other=0.0,
+            + dim_offsets[None, :] * kv_stride_d
         )
+        if EXACT_TILE:
+            kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
+        else:
+            kv = tl.load(kv_ptrs, mask=valid[:, None] & dim_mask[None, :], other=0.0)
 
         next_k_pos = k_start + BLOCK_K + k_offsets
         slot = tl.load(
@@ -1426,13 +1440,17 @@ def _sparse_attn_prefill_ragged_kernel(
         )
 
         scores = tl.dot(q, tl.trans(kv)) * scale
-        scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+        if EXACT_TILE:
+            keep = valid[None, :]
+        else:
+            keep = head_mask[:, None] & valid[None, :]
+        scores = tl.where(keep, scores, neg_large)
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(scores - m_new[:, None])
-        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+        p = tl.where(keep, p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
@@ -1440,9 +1458,202 @@ def _sparse_attn_prefill_ragged_kernel(
         l_i = l_new
 
     if HAS_ATTN_SINK:
-        sink = tl.load(
-            attn_sink_ptr + head_offsets, mask=head_mask, other=neg_large
-        ).to(tl.float32)
+        if EXACT_TILE:
+            sink = tl.load(attn_sink_ptr + head_offsets).to(tl.float32)
+        else:
+            sink = tl.load(
+                attn_sink_ptr + head_offsets, mask=head_mask, other=neg_large
+            ).to(tl.float32)
+        m_final = tl.maximum(m_i, sink)
+        alpha = tl.exp(m_i - m_final)
+        l_final = l_i * alpha + tl.exp(sink - m_final)
+        denom = tl.maximum(l_final, 1.0e-30)
+        out = tl.where(
+            l_final[:, None] > 0.0,
+            (acc * alpha[:, None]) / denom[:, None],
+            0.0,
+        )
+    else:
+        denom = tl.maximum(l_i, 1.0e-30)
+        out = tl.where(l_i[:, None] > 0.0, acc / denom[:, None], 0.0)
+
+    out_ptrs = (
+        out_ptr
+        + query_idx * out_stride_t
+        + head_offsets[:, None] * out_stride_h
+        + dim_offsets[None, :] * out_stride_d
+    )
+    if EXACT_TILE:
+        tl.store(out_ptrs, out)
+    else:
+        tl.store(out_ptrs, out, mask=head_mask[:, None] & dim_mask[None, :])
+
+
+@triton.jit
+def _sparse_attn_prefill_blocked_kernel(
+    q_ptr,
+    kv_ptr,
+    block_req_ptr,
+    block_qstart_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    attn_sink_ptr,
+    out_ptr,
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    kv_stride_n,
+    kv_stride_d,
+    out_stride_t,
+    out_stride_h,
+    out_stride_d,
+    top_k,
+    row_stride,
+    swa_offset,
+    scale,
+    HAS_ATTN_SINK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Query-blocked dense-causal attention for the compress_ratio=128 layers.
+
+    Those layers have no indexer: their "top-k" list is the positional identity
+    prefix and a sliding window, built by
+    ``sparse_mla.py::_build_c128a_topk_metadata_kernel`` and
+    ``rocm.py::_combine_topk_swa_indices_kernel``. Both segments are therefore
+    *contiguous row ranges* whose bounds are closed-form in the query position,
+    so this kernel reads no index list at all -- it re-derives the same rows,
+    and the CPU test in ``test_rocm_triton_attn_dsv4.py`` pins the two
+    derivations equal query by query.
+
+    ``BLOCK_M`` consecutive queries of one request share a CTA. Their prefixes
+    are nested (lengths differ by at most one row per 128 positions) and their
+    windows slide by one row per position, so the block's row set is the last
+    query's prefix plus the union of the windows, each KV row is loaded once
+    instead of ``BLOCK_M`` times, and the ``tl.dot`` runs at
+    ``M = BLOCK_M * BLOCK_H`` against Ampere's ``m16n8k16`` rather than at
+    ``BLOCK_H = 8``, which wastes half of every issue.
+
+    Masking is per query and only where the queries disagree: the shared body
+    of both segments takes a mask-free path (the EXACT_TILE lesson -- a
+    constant-true tile mask costs ~9% on this kernel family).
+    """
+    blk = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    req = tl.load(block_req_ptr + blk)
+    q_lo = tl.load(block_qstart_ptr + blk)
+
+    base = tl.load(query_start_loc_ptr)
+    query_start = tl.load(query_start_loc_ptr + req) - base
+    query_end = tl.load(query_start_loc_ptr + req + 1) - base
+    seq_len = tl.load(seq_lens_ptr + req)
+    gather_start = seq_len - tl.load(gather_lens_ptr + req)
+    start_pos = seq_len - (query_end - query_start)
+
+    # Rows of the MMA are (query, head) pairs, query-major. Everything the mask
+    # needs is derived on that axis so no tile is ever indexed by another tile.
+    row_offsets = tl.arange(0, BLOCK_M * BLOCK_H)
+    token = q_lo + row_offsets // BLOCK_H
+    row_valid = token < query_end
+    # Rows past the request's last query re-read its q and are dropped at the
+    # store; clamping keeps every load in range without predicating it.
+    safe_token = tl.where(row_valid, token, query_end - 1)
+    head_offsets = pid_h * BLOCK_H + row_offsets % BLOCK_H
+    dim_offsets = tl.arange(0, BLOCK_D)
+
+    pos = start_pos + safe_token - query_start
+    topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, top_k)
+    swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+    swa_start = pos + 1 - swa_len - gather_start
+
+    # Union of the block's rows. The prefixes nest, so their union is the
+    # longest; the windows slide, so theirs is one contiguous run.
+    prefix_len = tl.max(topk_len, axis=0)
+    prefix_shared = tl.min(topk_len, axis=0)
+    window_base = tl.min(swa_start, axis=0)
+    window_len = tl.max(swa_start + swa_len, axis=0) - window_base
+    window_lo = swa_start - window_base
+    window_hi = window_lo + swa_len
+    window_lo_max = tl.max(window_lo, axis=0)
+    window_hi_min = tl.min(window_hi, axis=0)
+
+    slab = req * row_stride
+
+    q = tl.load(
+        q_ptr
+        + safe_token[:, None] * q_stride_t
+        + head_offsets[:, None] * q_stride_h
+        + dim_offsets[None, :] * q_stride_d
+    )
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_M * BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M * BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M * BLOCK_H, BLOCK_D), dtype=tl.float32)
+    k_offsets = tl.arange(0, BLOCK_K)
+
+    for k_start in tl.range(0, prefix_len, BLOCK_K):
+        k_pos = k_start + k_offsets
+        row = slab + tl.where(k_pos < prefix_len, k_pos, 0)
+        kv = tl.load(
+            kv_ptr + row[:, None] * kv_stride_n + dim_offsets[None, :] * kv_stride_d
+        )
+        scores = tl.dot(q, tl.trans(kv)) * scale
+
+        if k_start + BLOCK_K <= prefix_shared:
+            m_block = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_block)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+        else:
+            keep = k_pos[None, :] < topk_len[:, None]
+            scores = tl.where(keep, scores, neg_large)
+            m_block = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_block)
+            alpha = tl.exp(m_i - m_new)
+            # A query whose prefix is empty has every score masked, so its
+            # running max is still -inf and exp(scores - m_new) would be 1.
+            p = tl.where(keep, tl.exp(scores - m_new[:, None]), 0.0)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+
+    for k_start in tl.range(0, window_len, BLOCK_K):
+        k_pos = k_start + k_offsets
+        row = slab + swa_offset + window_base + tl.where(k_pos < window_len, k_pos, 0)
+        kv = tl.load(
+            kv_ptr + row[:, None] * kv_stride_n + dim_offsets[None, :] * kv_stride_d
+        )
+        scores = tl.dot(q, tl.trans(kv)) * scale
+
+        if k_start >= window_lo_max and k_start + BLOCK_K <= window_hi_min:
+            m_block = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_block)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+        else:
+            keep = (k_pos[None, :] >= window_lo[:, None]) & (
+                k_pos[None, :] < window_hi[:, None]
+            )
+            scores = tl.where(keep, scores, neg_large)
+            m_block = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_block)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.where(keep, tl.exp(scores - m_new[:, None]), 0.0)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+
+    if HAS_ATTN_SINK:
+        sink = tl.load(attn_sink_ptr + head_offsets).to(tl.float32)
         m_final = tl.maximum(m_i, sink)
         alpha = tl.exp(m_i - m_final)
         l_final = l_i * alpha + tl.exp(sink - m_final)
@@ -1458,12 +1669,13 @@ def _sparse_attn_prefill_ragged_kernel(
 
     tl.store(
         out_ptr
-        + query_idx * out_stride_t
+        + safe_token[:, None] * out_stride_t
         + head_offsets[:, None] * out_stride_h
         + dim_offsets[None, :] * out_stride_d,
         out,
-        mask=head_mask[:, None] & dim_mask[None, :],
+        mask=row_valid[:, None],
     )
+
 
 
 @triton.jit
@@ -1498,10 +1710,7 @@ def _load_fp8_ds_mla_gfx950_nope_exact_chunk(
     scales = _decode_e8m0_scales_triton(encoded_scales)
     scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, CHUNK_SIZE // 64, 64))
     scales = tl.reshape(scales, (BLOCK_K, CHUNK_SIZE))
-    if IS_FNUZ:
-        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
-    else:
-        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ)
     value = (x_f32 * scales).to(tl.bfloat16)
     zero = tl.zeros((BLOCK_K, CHUNK_SIZE), dtype=tl.bfloat16)
     return tl.where(valid[:, None], value, zero)
@@ -1533,10 +1742,7 @@ def _load_fp8_ds_mla_gfx950_tail128(
     scales = _decode_e8m0_scales_triton(encoded_scales)
     scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, 2, 64))
     scales = tl.reshape(scales, (BLOCK_K, 128))
-    if IS_FNUZ:
-        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
-    else:
-        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ)
     nope = (x_f32 * scales).to(tl.bfloat16)
 
     rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
@@ -1560,6 +1766,7 @@ def _sparse_attn_decode_ragged_kernel(
     extra_indices_ptr,
     extra_indptr_ptr,
     attn_sink_ptr,
+    fp8_lut_ptr,
     out_ptr,
     q_stride0,
     q_stride1,
@@ -1638,17 +1845,15 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr).to(
+            tl.bfloat16
+        ) * scales.to(tl.bfloat16)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1706,17 +1911,15 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr).to(
+                tl.bfloat16
+            ) * scales.to(tl.bfloat16)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1798,6 +2001,7 @@ def _sparse_attn_decode_partial_kernel(
     part_m_ptr,
     part_l_ptr,
     part_acc_ptr,
+    fp8_lut_ptr,
     q_stride0,
     q_stride1,
     main_cache_stride0,
@@ -1888,17 +2092,15 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr).to(
+            tl.bfloat16
+        ) * scales.to(tl.bfloat16)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1959,17 +2161,15 @@ def _sparse_attn_decode_partial_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr).to(
+                tl.bfloat16
+            ) * scales.to(tl.bfloat16)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -2022,6 +2222,331 @@ def _sparse_attn_decode_partial_kernel(
         acc_rope,
         mask=head_mask[:, None],
     )
+
+
+@triton.jit
+def _blocked_decode_segment(
+    q_nope,
+    q_rope,
+    m_i,
+    l_i,
+    acc_nope,
+    acc_rope,
+    cache_ptr,
+    indices_ptr,
+    src_head,
+    src_tail,
+    front_extra,
+    seg_lo,
+    seg_hi,
+    row_lo,
+    row_hi,
+    lo_max,
+    hi_min,
+    fp8_lut_ptr,
+    cache_stride0,
+    cache_block_size,
+    num_rows,
+    scale,
+    IS_FNUZ: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """One KV segment of the query-blocked decode kernel.
+
+    Walks ``[seg_lo, seg_hi)`` of the block's *union* index list. Union
+    coordinates below ``front_extra`` are read from ``src_head`` (the first
+    query's list) and the rest from ``src_tail`` (the last query's), which is
+    how a sliding window is reassembled from two of its own members; a nested
+    prefix passes ``front_extra = 0`` and the same pointer twice.
+
+    ``row_lo``/``row_hi`` are each row's valid range in those coordinates. The
+    block scalars ``lo_max``/``hi_min`` bound the sub-range every row wants, so
+    tiles inside it skip the per-row compare entirely.
+    """
+    neg_large = -3.4028234663852886e38
+    k_offsets = tl.arange(0, BLOCK_K)
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    nope_mask = nope_offsets < NOPE_DIM
+    rope_offsets = tl.arange(0, ROPE_DIM)
+    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
+    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+
+    for k_start in tl.range(seg_lo, seg_hi, BLOCK_K, num_stages=NUM_STAGES):
+        k_pos = k_start + k_offsets
+        in_range = k_pos < seg_hi
+        src = tl.where(
+            k_pos < front_extra, src_head + k_pos, src_tail + k_pos - front_extra
+        )
+        slot = tl.load(indices_ptr + src, mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < num_rows)
+        safe_slot = tl.where(valid, slot, 0)
+
+        block_idx = safe_slot // cache_block_size
+        pos_in_block = safe_slot % cache_block_size
+        cache_block_ptr = cache_ptr + block_idx.to(tl.int64) * cache_stride0
+        token_data_ptr = cache_block_ptr + pos_in_block * 576
+        token_scale_ptr = cache_block_ptr + cache_block_size * 576 + pos_in_block * 8
+
+        x_uint8 = tl.load(
+            token_data_ptr[:, None] + nope_offsets[None, :],
+            mask=valid[:, None] & nope_mask[None, :],
+            other=0,
+        )
+        k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ, fp8_lut_ptr)
+        encoded_scales = tl.load(
+            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+            mask=valid[:, None] & nope_mask[None, :],
+            other=127,
+        )
+        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+        rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+        k_rope = tl.load(
+            rope_ptr[:, None] + rope_offsets[None, :], mask=valid[:, None], other=0.0
+        )
+        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+
+        scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
+        scores *= scale
+        if k_start >= lo_max and k_start + BLOCK_K <= hi_min:
+            keep = tl.broadcast_to(valid[None, :], scores.shape)
+        else:
+            keep = (
+                valid[None, :]
+                & (k_pos[None, :] >= row_lo[:, None])
+                & (k_pos[None, :] < row_hi[:, None])
+            )
+        scores = tl.where(keep, scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.where(keep, tl.exp(scores - m_new[:, None]), 0.0)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+        m_i = m_new
+
+    return m_i, l_i, acc_nope, acc_rope
+
+
+@triton.jit
+def _sparse_attn_decode_partial_blocked_kernel(
+    q_ptr,
+    main_cache_ptr,
+    main_indices_ptr,
+    main_indptr_ptr,
+    extra_cache_ptr,
+    extra_indices_ptr,
+    extra_indptr_ptr,
+    part_m_ptr,
+    part_l_ptr,
+    part_acc_ptr,
+    fp8_lut_ptr,
+    q_stride0,
+    q_stride1,
+    main_cache_stride0,
+    extra_cache_stride0,
+    pm_stride0,
+    pm_stride_s,
+    pa_stride0,
+    pa_stride_s,
+    pa_stride_h,
+    main_num_rows,
+    extra_num_rows,
+    main_block_size,
+    extra_block_size,
+    scale,
+    group_size,
+    HAS_EXTRA: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_FNUZ_MAIN: tl.constexpr,
+    IS_FNUZ_EXTRA: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """Split-K decode partials for a whole query group at once.
+
+    One CTA serves one request's ``group_size`` (= ``next_n``) speculative
+    query tokens instead of one token. They sit at consecutive positions, so
+    the compressed segment's index lists are nested prefixes of the longest and
+    the SWA windows are slices of one 128+``group_size``-1 run -- both derived
+    here from ``indptr`` alone, so this path needs no metadata the per-query
+    kernel does not already build. Each cache row is fp8-decoded once for the
+    whole group rather than once per token, and the ``tl.dot`` runs at
+    ``M = BLOCK_M * BLOCK_H``.
+
+    ``BLOCK_M`` is ``group_size`` rounded up to a power of two; the padding
+    rows are masked out of the accumulation and of the store.
+    """
+    blk = tl.program_id(0)
+    split_id = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    # Query groups are packed back to back, so the tile's padding rows are not
+    # part of the stride: block `blk` starts at `blk * group_size`, and rows at
+    # or past `group_size` re-read row 0 and are dropped at the store.
+    q_base = blk * group_size
+    row_offsets = tl.arange(0, BLOCK_M * BLOCK_H)
+    row_index = row_offsets // BLOCK_H
+    row_valid = row_index < group_size
+    safe_index = tl.where(row_valid, row_index, 0)
+    token = q_base + safe_index
+    head_offsets = pid_h * BLOCK_H + row_offsets % BLOCK_H
+
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    nope_mask = nope_offsets < NOPE_DIM
+    rope_offsets = tl.arange(0, ROPE_DIM)
+
+    q_row_ptr = q_ptr + token * q_stride0 + head_offsets * q_stride1
+    q_nope = tl.load(
+        q_row_ptr[:, None] + nope_offsets[None, :], mask=nope_mask[None, :], other=0.0
+    )
+    q_rope = tl.load(q_row_ptr[:, None] + NOPE_DIM + rope_offsets[None, :])
+
+    neg_large = -3.4028234663852886e38
+    int_large = 2147483647
+    m_i = tl.full((BLOCK_M * BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M * BLOCK_H,), dtype=tl.float32)
+    acc_nope = tl.zeros((BLOCK_M * BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
+    acc_rope = tl.zeros((BLOCK_M * BLOCK_H, ROPE_DIM), dtype=tl.float32)
+
+    # SWA: window m starts one row later than window m-1 and they all end at
+    # `first_len + m`, so the union is the first query's list extended by the
+    # last query's. The clamp keeps a padding-only block (every length zero,
+    # which is what a captured graph's spare rows carry) from reading past the
+    # segment it anchors on; on real groups it is inert.
+    main_start_first = tl.load(main_indptr_ptr + q_base)
+    main_len_first = tl.load(main_indptr_ptr + q_base + 1) - main_start_first
+    main_start_last = tl.load(main_indptr_ptr + q_base + group_size - 1)
+    main_len_last = tl.load(main_indptr_ptr + q_base + group_size) - main_start_last
+    main_front = tl.minimum(
+        tl.maximum(group_size - 1 + main_len_first - main_len_last, 0), main_len_first
+    )
+    main_union = main_front + main_len_last
+    main_row_len = tl.load(main_indptr_ptr + token + 1) - tl.load(
+        main_indptr_ptr + token
+    )
+    main_hi = tl.where(
+        row_valid, tl.minimum(safe_index + main_len_first, main_union), 0
+    )
+    main_lo = tl.maximum(main_hi - main_row_len, 0)
+    main_lo_max = tl.max(tl.where(row_valid, main_lo, 0), axis=0)
+    main_hi_min = tl.min(tl.where(row_valid, main_hi, int_large), axis=0)
+
+    main_chunk = (main_union + NUM_SPLITS - 1) // NUM_SPLITS
+    m_i, l_i, acc_nope, acc_rope = _blocked_decode_segment(
+        q_nope,
+        q_rope,
+        m_i,
+        l_i,
+        acc_nope,
+        acc_rope,
+        main_cache_ptr,
+        main_indices_ptr,
+        main_start_first,
+        main_start_last,
+        main_front,
+        split_id * main_chunk,
+        tl.minimum(split_id * main_chunk + main_chunk, main_union),
+        main_lo,
+        main_hi,
+        main_lo_max,
+        main_hi_min,
+        fp8_lut_ptr,
+        main_cache_stride0,
+        main_block_size,
+        main_num_rows,
+        scale,
+        IS_FNUZ=IS_FNUZ_MAIN,
+        NOPE_DIM=NOPE_DIM,
+        NOPE_BLOCK=NOPE_BLOCK,
+        ROPE_DIM=ROPE_DIM,
+        BLOCK_K=BLOCK_K,
+        NUM_STAGES=NUM_STAGES,
+    )
+
+    if HAS_EXTRA:
+        # Compressed: (pos+1)//128 rows, so the lists nest and the union is the
+        # longest of them. Every row starts at 0, which makes the shared body
+        # mask-free up to the shortest length.
+        extra_start_last = tl.load(extra_indptr_ptr + q_base + group_size - 1)
+        extra_union = (
+            tl.load(extra_indptr_ptr + q_base + group_size) - extra_start_last
+        )
+        extra_row_len = tl.load(extra_indptr_ptr + token + 1) - tl.load(
+            extra_indptr_ptr + token
+        )
+        extra_hi = tl.where(row_valid, tl.minimum(extra_row_len, extra_union), 0)
+        extra_lo = tl.zeros((BLOCK_M * BLOCK_H,), dtype=extra_hi.dtype)
+        extra_hi_min = tl.min(tl.where(row_valid, extra_hi, int_large), axis=0)
+
+        extra_chunk = (extra_union + NUM_SPLITS - 1) // NUM_SPLITS
+        m_i, l_i, acc_nope, acc_rope = _blocked_decode_segment(
+            q_nope,
+            q_rope,
+            m_i,
+            l_i,
+            acc_nope,
+            acc_rope,
+            extra_cache_ptr,
+            extra_indices_ptr,
+            extra_start_last,
+            extra_start_last,
+            0,
+            split_id * extra_chunk,
+            tl.minimum(split_id * extra_chunk + extra_chunk, extra_union),
+            extra_lo,
+            extra_hi,
+            0,
+            extra_hi_min,
+            fp8_lut_ptr,
+            extra_cache_stride0,
+            extra_block_size,
+            extra_num_rows,
+            scale,
+            IS_FNUZ=IS_FNUZ_EXTRA,
+            NOPE_DIM=NOPE_DIM,
+            NOPE_BLOCK=NOPE_BLOCK,
+            ROPE_DIM=ROPE_DIM,
+            BLOCK_K=BLOCK_K,
+            NUM_STAGES=NUM_STAGES,
+        )
+
+    pm_base = token * pm_stride0 + split_id * pm_stride_s + head_offsets
+    tl.store(part_m_ptr + pm_base, m_i, mask=row_valid)
+    tl.store(part_l_ptr + pm_base, l_i, mask=row_valid)
+    acc_base = (
+        part_acc_ptr
+        + token * pa_stride0
+        + split_id * pa_stride_s
+        + head_offsets * pa_stride_h
+    )
+    tl.store(
+        acc_base[:, None] + nope_offsets[None, :],
+        acc_nope,
+        mask=row_valid[:, None] & nope_mask[None, :],
+    )
+    tl.store(
+        acc_base[:, None] + NOPE_DIM + rope_offsets[None, :],
+        acc_rope,
+        mask=row_valid[:, None],
+    )
+
 
 
 @triton.jit
@@ -2545,6 +3070,320 @@ def _sparse_attn_decode_reduce_kernel(
     )
 
 
+def build_query_blocks(
+    query_start_loc: torch.Tensor,
+    block_m: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cut a chunk's queries into ``block_m``-row blocks, none crossing a request.
+
+    Returns ``(block_req, block_qstart)``: for each block, the chunk-local
+    request index it belongs to and its first query row (also chunk-local).
+    The last block of a request is short whenever its query count is not a
+    multiple of ``block_m``; the kernel masks those rows at the store.
+
+    Depends only on the chunk's query layout, so one build serves all 20
+    ratio-128 layers -- ``_forward_prefill`` caches it per chunk.
+    """
+    qsl = query_start_loc.to(torch.int64).cpu()
+    starts = qsl[:-1] - qsl[0]
+    lengths = qsl[1:] - qsl[:-1]
+    counts = torch.div(lengths + block_m - 1, block_m, rounding_mode="floor")
+    block_req = torch.repeat_interleave(
+        torch.arange(counts.numel(), dtype=torch.int64), counts
+    )
+    first_block = torch.cumsum(counts, 0) - counts
+    within = torch.arange(int(counts.sum()), dtype=torch.int64) - first_block[block_req]
+    block_qstart = starts[block_req] + within * block_m
+    return (
+        block_req.to(device=device, dtype=torch.int32),
+        block_qstart.to(device=device, dtype=torch.int32),
+    )
+
+
+def _rocm_sparse_attn_prefill_blocked_triton(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    block_req: torch.Tensor,
+    block_qstart: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor | None,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    top_k: int,
+    row_stride: int,
+    swa_offset: int,
+    compress_ratio: int,
+    window_size: int,
+    block_m: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
+    assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
+    num_queries, num_heads, head_dim = q.shape
+    _validate_dsv4_sparse_dims(
+        head_dim,
+        nope_head_dim,
+        rope_head_dim,
+        "_rocm_sparse_attn_prefill_blocked_triton",
+    )
+
+    has_attn_sink = attn_sink is not None
+    if attn_sink is None:
+        attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
+    else:
+        attn_sink = attn_sink.contiguous()
+
+    block_h = _sparse_block_h(num_heads)
+    block_d = triton.next_power_of_2(head_dim)
+    block_k = _prefill_block_k(head_dim)
+    # The kernel loads its q/kv/out tiles unmasked in the head and dim
+    # dimensions; ranks whose head count is not a multiple of the tile, or
+    # whose head_dim is not a power of two, stay on the per-query kernel.
+    assert num_heads % block_h == 0 and head_dim == block_d, (
+        f"blocked prefill needs heads%{block_h}==0 and head_dim=={block_d}, "
+        f"got heads={num_heads} head_dim={head_dim}"
+    )
+
+    if out is None:
+        out = torch.empty_like(q, dtype=torch.bfloat16)
+    _sparse_attn_prefill_blocked_kernel[
+        (block_req.numel(), num_heads // block_h)
+    ](
+        q,
+        kv,
+        block_req,
+        block_qstart,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv.stride(0),
+        kv.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        int(top_k),
+        int(row_stride),
+        int(swa_offset),
+        float(scale),
+        HAS_ATTN_SINK=has_attn_sink,
+        COMPRESS_RATIO=compress_ratio,
+        WINDOW_SIZE=window_size,
+        BLOCK_M=block_m,
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        num_warps=_prefill_blocked_num_warps(block_m),
+    )
+    return out
+
+
+def _prefill_blocked_num_warps(block_m: int) -> int:
+    """Warps for a ``block_m``-query tile. Measured, and not what was predicted.
+
+    The model this shipped with -- warps track the tile so the
+    ``[BLOCK_M*BLOCK_H, BLOCK_D]`` fp32 accumulator costs the same per thread
+    at every width -- is refuted by the sweep at M=15,360/depth 200k (us, best
+    of each row in bold by inspection):
+
+        BLOCK_M   4 warps   8 warps   16 warps
+        1          10517     13837      22775
+        2           6038     11123      17810
+        4           6938      6471       9596
+        8          16288      4339       5838
+
+    It predicts 8/16/16 warps for BLOCK_M 2/4/8 and the measured optima are
+    4/8/8, so it would have shipped BLOCK_M=8 at 16 warps -- 35% off the best
+    config. What the data says instead: warps buy nothing except escaping the
+    spill cliff, and past it more warps cost throughput, which is canon SS8's
+    result (raising resident parallelism costs this kernel family bandwidth)
+    rather than the exception to it the model assumed. The cliff is visible in
+    one cell: BLOCK_M=8 at 4 warps needs 256 accumulator registers per thread
+    and runs 3.8x slower than the same tile at 8.
+    """
+    return 4 if block_m <= 2 else 8
+
+
+def _decode_blocked_num_warps(block_m: int) -> int:
+    """Warps for the query-blocked decode tile.
+
+    Same rule as the prefill twin, off the per-query kernel's 8: that kernel
+    runs 8 rather than 4 because its ``[BLOCK_H, 512]`` fp32 accumulators spill
+    ~1.7 KB/thread at 4, and the blocked accumulators are ``block_m`` times
+    larger. Capped at 16 -- the KV tile's fp8 decode temporaries do not shrink
+    with the tile, so past that the warps only split work that is already
+    small.
+    """
+    return max(8, min(16, 8 * block_m // 2))
+
+
+def _query_block_size(env_value: int, default: int) -> int:
+    """Resolve a ``VLLM_SPARSE_DENSE_QUERY_BLOCK*`` setting to a tile width.
+
+    ``0`` disables the blocked path, ``-1`` takes ``default``, anything else is
+    the forced tile. The result is rounded *up* to a power of two, which is
+    what ``tl.arange`` needs: a 6-query decode group runs on an 8-row tile with
+    its last two rows masked, rather than on two 4-row tiles that would read
+    the request's rows twice.
+    """
+    if env_value == 0:
+        return 0
+    chosen = default if env_value < 0 else env_value
+    return triton.next_power_of_2(chosen) if chosen >= 1 else 0
+
+
+@functools.lru_cache
+def prefill_query_block_size(num_heads: int, head_dim: int) -> int:
+    """Query tile for the ratio-128 prefill layers; 0 means "use the old path".
+
+    BLOCK_M=8 is measured, not chosen: at the deep chunk (M=15,360, depth
+    200k) it runs 4,339 us against the per-query kernel's 12,178, and 16 is
+    unbuildable -- its q tile alone asks for 204,800 B of shared memory
+    against A100's 166,912 B limit, so 8 is the widest tile this kernel has.
+
+    Ranks whose head count is not a multiple of the head tile, or whose head
+    dim is not a power of two, keep the per-query kernel: the blocked one loads
+    those two dimensions unmasked.
+    """
+    block_m = _query_block_size(envs.VLLM_SPARSE_DENSE_QUERY_BLOCK, 8)
+    if block_m == 0:
+        return 0
+    if num_heads % _sparse_block_h(num_heads) or head_dim != triton.next_power_of_2(
+        head_dim
+    ):
+        return 0
+    return block_m
+
+
+def decode_block_tile(
+    group_size: int, num_queries: int, num_heads: int, block_h: int
+) -> int:
+    """Tile width for the blocked decode path, or 0 to keep the per-query one.
+
+    A query group's tokens sit at consecutive positions, so one CTA can serve
+    the whole group off one pass over the request's rows
+    (:func:`_sparse_attn_decode_partial_blocked_kernel`). Every condition that
+    has to hold for that lives here rather than inline at the launch, so
+    "which path ran" resolves to one function:
+
+    * a group of one query has nothing to block;
+    * the tile must be at least the group, since a group is never split across
+      CTAs -- this is what a forced ``VLLM_SPARSE_DENSE_QUERY_BLOCK_DECODE``
+      below ``next_n`` falls out of, and it declines rather than splitting;
+    * the query rows must divide into whole groups, or blocks would straddle
+      requests whose rows are unrelated;
+    * the head count must be a whole number of head tiles, since the kernel
+      loads that dimension unmasked.
+    """
+    if group_size <= 1:
+        return 0
+    block_m = decode_query_block_size(group_size)
+    if block_m < group_size:
+        return 0
+    if num_queries % group_size or num_heads % block_h:
+        return 0
+    return block_m
+
+
+@functools.lru_cache
+def decode_query_block_size(next_n: int) -> int:
+    """Query tile for the ratio-128 decode layers. **Default off: it loses.**
+
+    Measured at 200k context, next_n=6, against the per-query kernel each at
+    its own best split count (us, C = resident requests):
+
+        C     per query   blocked M=8
+        4      122 (s4)     229 (s8)
+        16     471 (s1)     611 (s6)
+        27     753 (s2)     916 (s4)
+
+    1.2-1.9x *slower* everywhere, against a pre-registered 2.0-3.5x band. The
+    mechanism is the one thing prefill and decode do not share: **prefill is
+    CTA-oversubscribed and decode is CTA-starved.** A 15,360-query chunk
+    launches 15,360 CTAs against 108 SMs, so trading 8x the CTAs for 8x fewer
+    row-loads costs nothing; a 27-request decode step launches 27, so the same
+    trade gives up the parallelism the kernel is actually short of, and split-K
+    only buys it back by adding reduce traffic. The row-load saving is real
+    (6x) and does not pay for that.
+
+    It also falsifies the reason this half was expected to beat prefill's:
+    giving one CTA 8x the MMA work over the same rows barely moves its time,
+    so the per-CTA cost was never dominated by the fp8 gather the blocking
+    amortises.
+
+    Correctness is not the reason it is off -- the blocked kernel reproduces
+    the per-query kernel to 3.3e-3, which is exactly what the per-query kernel
+    scores against *itself* at a different split count. The flag stays so the
+    result can be re-derived; ``VLLM_SPARSE_DENSE_QUERY_BLOCK_DECODE=6`` turns
+    it on.
+    """
+    if next_n < 2:
+        return 0
+    return _query_block_size(envs.VLLM_SPARSE_DENSE_QUERY_BLOCK_DECODE, 0)
+
+
+@functools.lru_cache
+def _exact_tile_enabled() -> bool:
+    return envs.VLLM_SPARSE_PREFILL_EXACT_TILE
+
+
+@functools.lru_cache
+def _sparse_block_h(num_heads: int) -> int:
+    """Head tile for the sparse prefill and split-K decode kernels.
+
+    A hardcoded 16 masks off half of every ``tl.dot`` at TP=8, where a rank
+    owns 8 heads. Sizing the tile to the heads that exist measures **-6.3%**
+    on A100 for prefill on top of the wider KV tile (561 -> 526 us at
+    M=2048/ctx=32k); decode gains a second effect -- its ``[BLOCK_H, 512]``
+    fp32 accumulators halve with the tile. Bit-identical in both kernels:
+    each head's softmax reduction is independent, so repartitioning heads
+    across CTAs cannot change a single output bit, which is what testing head
+    counts 8/16/4/5 against BLOCK_H=16 confirms.
+
+    Ranks holding more than 8 heads keep 16, which is today's tile: this only
+    stops building a tile twice the size of the data.
+    """
+    return min(16, max(8, triton.next_power_of_2(num_heads)))
+
+
+@functools.lru_cache
+def _prefill_block_k(head_dim: int) -> int:
+    """KV tile width for the ragged sparse prefill kernel.
+
+    At ``head_dim >= 256`` the ``[BLOCK_H, BLOCK_D] x [BLOCK_D, BLOCK_K]`` dot
+    is latency-bound at ``BLOCK_K=16``: doubling the tile halves the loop trip
+    count and measured **-17% to -23% at every prefill shape** on A100
+    (M=2048/ctx=32k: 721 -> 561 us; M=512/ctx=8k: 208 -> 161 us), with
+    BLOCK_K=64 worse than either. It costs one CTA/SM -- 3 -> 2, occupancy
+    18.8% -> 12.5% -- which is the opposite direction from the occupancy this
+    kernel was expected to need, and it wins anyway.
+
+    The cost is smem: 49,664 B/CTA at 16 against 82,944 B at 32. That fits
+    A100's 164 KB/SM but not AMD's 64 KB LDS per workgroup, which is what the
+    plain ``head_dim >= 256`` rule was protecting. So the tile widens only
+    where the device reports room for it, and every other device keeps 16.
+    """
+    if head_dim < 256:
+        return 32
+    try:
+        # Same opt-in per-block attribute the hand query read; the except
+        # keeps ROCm (which does not expose it) on the narrow tile.
+        smem = get_max_shared_memory_bytes()
+    except Exception:
+        return 16
+    # Two CTAs of the wide tile plus headroom; below this the wide tile either
+    # will not launch or drops to 1 CTA/SM, which measured slower than 16.
+    return 32 if smem >= 96 * 1024 else 16
+
+
 def _rocm_sparse_attn_prefill_ragged_triton(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -2580,10 +3419,11 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         "_rocm_sparse_attn_prefill_ragged_triton",
     )
 
-    block_h = 16
+    block_h = _sparse_block_h(num_heads)
     block_d = triton.next_power_of_2(head_dim)
-    block_k = 16 if head_dim >= 256 else 32
+    block_k = _prefill_block_k(head_dim)
     num_warps = 4
+    exact_tile = _exact_tile_enabled() and num_heads == block_h and head_dim == block_d
     out = torch.empty_like(q, dtype=torch.bfloat16)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
@@ -2608,6 +3448,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        EXACT_TILE=exact_tile,
         num_warps=num_warps,
     )
     return out
@@ -2859,7 +3700,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
-    block_h = 16
+    block_h = _sparse_block_h(num_heads)
     if out is None:
         out = torch.empty_like(q, dtype=torch.bfloat16)
     else:
@@ -2874,8 +3715,12 @@ def _rocm_sparse_attn_decode_ragged_triton(
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
+    fp8_lut = get_e4m3fn_bf16_lut(q.device)
 
-    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
+    if not (current_platform.is_cuda() or _ON_GFX942 or _ON_GFX950):
+        # Single-pass fallback for un-tuned non-CUDA architectures.
+        # CUDA (SM80) uses split-K below: a single-query decode otherwise
+        # occupies only a handful of an A100's 108 SMs.
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -2886,6 +3731,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             extra_indices,
             extra_indptr,
             attn_sink,
+            fp8_lut,
             out,
             q.stride(0),
             q.stride(1),
@@ -3005,6 +3851,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             part_m,
             part_l,
             part_acc,
+            fp8_lut,
             q.stride(0),
             q.stride(1),
             main_cache.stride(0),
@@ -3169,6 +4016,73 @@ def rocm_sparse_attn_prefill(
             topk_length=topk_length,
         )
     output.copy_(output_chunk.to(output.dtype))
+
+
+def rocm_sparse_attn_prefill_blocked(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    block_req: torch.Tensor,
+    block_qstart: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    scale: float,
+    head_dim: int,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    attn_sink: torch.Tensor | None,
+    top_k: int,
+    row_stride: int,
+    swa_offset: int,
+    compress_ratio: int,
+    window_size: int,
+    block_m: int,
+    output: torch.Tensor,
+) -> None:
+    """Query-blocked prefill for the layers whose index list is positional.
+
+    Same contract as :func:`rocm_sparse_attn_prefill` minus the index list:
+    this path re-derives the rows from the query positions, so the caller does
+    not build (or allocate) the dense combined indices at all.
+    """
+    assert kv.ndim == 3 and kv.shape[1] == 1, (
+        f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
+    )
+    _validate_dsv4_sparse_dims(
+        head_dim,
+        nope_head_dim,
+        rope_head_dim,
+        "rocm_sparse_attn_prefill_blocked",
+    )
+    write_in_place = (
+        output.dtype == torch.bfloat16
+        and output.shape == q.shape
+        and output.stride(-1) == 1
+        and output.data_ptr() != q.data_ptr()
+    )
+    out = _rocm_sparse_attn_prefill_blocked_triton(
+        q=q,
+        kv=kv.squeeze(1),
+        block_req=block_req,
+        block_qstart=block_qstart,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        scale=scale,
+        attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
+        nope_head_dim=nope_head_dim,
+        rope_head_dim=rope_head_dim,
+        top_k=top_k,
+        row_stride=row_stride,
+        swa_offset=swa_offset,
+        compress_ratio=compress_ratio,
+        window_size=window_size,
+        block_m=block_m,
+        out=output if write_in_place else None,
+    )
+    if not write_in_place:
+        output.copy_(out.to(output.dtype))
+
 
 
 def rocm_sparse_attn_decode(

@@ -579,6 +579,49 @@ class DeepSeekMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
 
 
+_DSV4_CAUSAL_ARCH = "DeepseekV4ForCausalLM"
+_DSV4_VL_ARCH = "DeepseekV4ForConditionalGeneration"
+_DSV4_DRAFT_ARCHS = frozenset({"DSparkDraftModel", "DeepSeekV4MTPModel"})
+
+
+def _dsv4_architectures(hf_config: PretrainedConfig) -> list[str]:
+    archs = getattr(hf_config, "architectures", None) or []
+    if isinstance(archs, str):
+        return [archs]
+    return list(archs)
+
+
+def _rewrite_dsv4_vision_architecture(hf_config: PretrainedConfig) -> None:
+    """Route Vision-Exp to the VL wrapper.
+
+    DeepSeek-V4-Flash-Vision-Exp ships the same ``model_type`` /
+    ``architectures`` as text-only Flash. Mutate the raw
+    ``hf_config.architectures`` (not just ``get_architectures``) because
+    model-class resolution reads that attribute. Speculative-draft configs
+    keep their own classes. The VL wrapper marks the inner text-backbone
+    copy with ``_dsv4_vl_inner`` so this rewrite does not recurse.
+    """
+    if getattr(hf_config, "_dsv4_vl_inner", False):
+        return
+    if getattr(hf_config, "vision_n_layers", 0) <= 0:
+        return
+    archs = _dsv4_architectures(hf_config)
+    if _DSV4_VL_ARCH in archs:
+        return
+    if any(arch in _DSV4_DRAFT_ARCHS for arch in archs):
+        return
+    if _DSV4_CAUSAL_ARCH not in archs:
+        return
+    hf_config.architectures = [_DSV4_VL_ARCH]
+    logger.info_once(
+        "DeepSeek-V4 config has vision_n_layers=%s; rewriting "
+        "architectures from %s to %s.",
+        hf_config.vision_n_layers,
+        ",".join(archs),
+        _DSV4_VL_ARCH,
+    )
+
+
 class DeepseekV4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
     def __init__(
         self,
@@ -586,21 +629,7 @@ class DeepseekV4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         hf_text_config: PretrainedConfig,
         revision: str | None = None,
     ):
-        # DeepSeek-V4-Flash-Vision-Exp ships the same architectures/model_type
-        # as the text-only DeepSeek-V4-Flash; route to the VL wrapper class
-        # when the config carries a vision tower. Mutate (not just override
-        # get_architectures) because model-class resolution reads the raw
-        # hf_config.architectures (get_model_architecture).
-        # Only rewrite the stock text architecture: speculative-draft configs
-        # (DSparkDraftModel / DeepSeekV4MTPModel) keep their own classes, and
-        # the VL wrapper marks the config copy it hands to the inner text
-        # backbone with _dsv4_vl_inner so this rewrite does not recurse.
-        if (
-            getattr(hf_config, "vision_n_layers", 0) > 0
-            and getattr(hf_config, "architectures", None) == ["DeepseekV4ForCausalLM"]
-            and not getattr(hf_config, "_dsv4_vl_inner", False)
-        ):
-            hf_config.architectures = ["DeepseekV4ForConditionalGeneration"]
+        _rewrite_dsv4_vision_architecture(hf_config)
         super().__init__(hf_config, hf_text_config, revision)
 
     def is_mm_prefix_lm(self, supports_multimodal: bool = True) -> bool:

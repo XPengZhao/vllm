@@ -192,6 +192,19 @@ class GateLinear(ReplicatedLinear):
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
 
+        # SM80 decode: one-CTA-per-row Triton GEMV beats cuBLAS split-K at M<=8.
+        if (
+            not self.allow_specialized_router_gemm
+            and self.weight.dtype == torch.bfloat16
+        ):
+            from vllm.model_executor.kernels.linear.gemv_triton import (
+                bf16_gemv,
+                should_use_triton_gemv,
+            )
+
+            if should_use_triton_gemv(x, self.weight):
+                return bf16_gemv(x, self.weight, self.out_dtype), None
+
         # Tier 5: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)

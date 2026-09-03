@@ -124,6 +124,24 @@ def split_tensor_along_last_dim(
     return tensor_list
 
 
+def balanced_row_counts(num_rows: int, size: int) -> list[int]:
+    """Per-rank row counts, ``base + (r < rem)``.
+
+    Remainder rows go one each to the lowest-numbered ranks, so the union over
+    ranks is exact with no gap, overlap, or padding row at any row count.
+    """
+    base, rem = divmod(num_rows, size)
+    return [base + (r < rem) for r in range(size)]
+
+
+def balanced_row_bounds(start: int, stop: int, rank: int, size: int) -> tuple[int, int]:
+    """This rank's contiguous half-open ``balanced_row_counts`` range within
+    ``[start, stop)``, in closed form."""
+    base, rem = divmod(stop - start, size)
+    lo = start + rank * base + min(rank, rem)
+    return lo, lo + base + (rank < rem)
+
+
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> tuple[int, int]:

@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group, get_tp_group
+from vllm.distributed.utils import balanced_row_bounds, balanced_row_counts
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -62,6 +63,186 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
             "earlier architectures are not supported."
         )
     return use_fp4
+
+
+MIN_SHARD_TOKENS = 2048
+
+
+class ShardedChunkSpec(NamedTuple):
+    """One prefill sub-chunk after TP query-sharding.
+
+    ``shard_row_counts``/``gather_start`` travel with the slice they describe,
+    so the top-k all-gather can never pair sizes with the wrong chunk. They are
+    None for sub-chunks left replicated; every rank emits the same chunk list
+    either way, so the set of collectives is rank-uniform by construction.
+    """
+
+    req_slice: slice
+    query_slice: slice
+    skip_kv_gather: bool
+    # Per-rank row counts for all_gatherv(sizes=...); None => replicated.
+    shard_row_counts: list[int] | None
+    # The pre-shard first row, where the gathered chunk is written back.
+    gather_start: int | None
+
+
+def shard_chunk_specs_by_query(
+    chunk_specs: list[tuple[slice, slice]], tp_rank: int, tp_size: int
+) -> list[ShardedChunkSpec]:
+    """Narrow each ``(req_slice, query_slice)`` to this rank's rows.
+
+    Sub-chunks with fewer rows than ranks stay replicated (counts None)
+    instead of leaving some ranks with an empty shard: dropping a chunk on
+    only the empty ranks would make the per-chunk all-gather participant set
+    data-dependent, which hangs rather than misbehaves.
+    """
+    if tp_size <= 1:
+        return [
+            ShardedChunkSpec(r, q, q.start > 0, None, None) for r, q in chunk_specs
+        ]
+
+    out: list[ShardedChunkSpec] = []
+    prev_req: tuple[int, int] | None = None
+    gathered_for_req = False
+    for req_slice, query_slice in chunk_specs:
+        req_key = (req_slice.start, req_slice.stop)
+        if req_key != prev_req:
+            # New request group => new K workspace contents => must re-gather.
+            prev_req = req_key
+            gathered_for_req = False
+        n = query_slice.stop - query_slice.start
+        if n < tp_size:
+            out.append(
+                ShardedChunkSpec(req_slice, query_slice, gathered_for_req, None, None)
+            )
+        else:
+            lo, hi = balanced_row_bounds(
+                query_slice.start, query_slice.stop, tp_rank, tp_size
+            )
+            out.append(
+                ShardedChunkSpec(
+                    req_slice,
+                    slice(lo, hi),
+                    gathered_for_req,
+                    balanced_row_counts(n, tp_size),
+                    query_slice.start,
+                )
+            )
+        gathered_for_req = True
+    return out
+
+
+def indexer_shard_size_for_batch(num_prefill_tokens: int, shard_size: int) -> int:
+    """``shard_size``, or 1 when this batch's prefill is too short to pay.
+
+    Below ``MIN_SHARD_TOKENS`` the per-chunk top-k all-gather costs more than
+    the indexer work it removes. Derived from CPU metadata every rank holds
+    identically: a rank-divergent answer here would desynchronise the
+    collective, which hangs rather than misbehaves.
+    """
+    return shard_size if num_prefill_tokens >= MIN_SHARD_TOKENS else 1
+
+
+def indexer_shard_is_eligible(tp_size: int, dcp_world_size: int, use_pcp: bool) -> bool:
+    """Whether this parallel config admits the indexer query shard at all.
+
+    Both halves (prefill rows, decode query groups) read this one predicate, so
+    neither can shard over a partition the other declines.
+    """
+    return tp_size > 1 and dcp_world_size == 1 and not use_pcp
+
+
+def indexer_decode_shard_rows(
+    bounds: tuple[int, int] | None, batch_size: int, next_n: int
+) -> tuple[int, int]:
+    """Batch-absolute top-k row range for this rank's decode query groups.
+
+    ``topk_indices_buffer`` is indexed by batch token, so query group ``g``
+    owns rows ``[g * next_n, (g + 1) * next_n)`` and this rank writes there
+    directly. Group-relative offsets are correct on rank 0 and silently
+    misplace every later rank's indices -- the failure that cost a gsm8k point
+    on the prefill half (canon rule 36).
+    """
+    lo, hi = bounds or (0, batch_size)
+    return lo * next_n, hi * next_n
+
+
+def indexer_decode_shard_bounds(
+    batch_size: int,
+    num_decodes: int,
+    shard_rank: int,
+    shard_size: int,
+    min_reqs: int,
+) -> tuple[int, int] | None:
+    """This rank's contiguous half-open slice of the decode query groups.
+
+    ``batch_size`` is the leading dimension the decode indexer kernels take:
+    one entry per request on the native path (each carrying ``next_n`` token
+    rows) and one per token on the flattening path, which is what SM80 runs at
+    ``next_n = 6``. Either way the entries are the kernel's independent query
+    groups and each owns a contiguous block of top-k rows, so partitioning this
+    dimension keeps every kernel call on a contiguous row range.
+
+    None means "compute every group" -- the replicated path -- and is returned
+    when the shard is off (``shard_size == 1``, i.e. tp=1/DCP/PCP/flag off),
+    when the batch has fewer than ``min_reqs`` decode requests, or when there
+    are fewer groups than ranks. The last case is what keeps every rank in the
+    reduction: a rank owning no group would still have to enter the collective,
+    and would launch the decode kernels over an empty row range to get there.
+
+    Every input is replicated batch metadata, so the answer is rank-uniform by
+    construction -- a rank-dependent one would desynchronise the per-layer
+    collective, which hangs rather than misbehaves.
+    """
+    if shard_size <= 1 or min_reqs <= 0:
+        return None
+    if num_decodes < min_reqs or batch_size < shard_size:
+        return None
+    return balanced_row_bounds(0, batch_size, shard_rank, shard_size)
+
+
+def indexer_q_row_ranges(
+    chunks: "list[DeepseekV32IndexerPrefillChunkMetadata]",
+    num_decodes: int,
+    num_tokens: int,
+) -> list[tuple[int, int]] | None:
+    """Rows of the indexer's Q path this rank must compute, or None for all.
+
+    The ranges are read back out of the chunk metadata rather than
+    re-partitioned, so they are by construction exactly the rows the chunk loop
+    will read (``q_quant[chunk.token_start : chunk.token_end]``). The caller
+    keeps ``q_quant``/``weights`` full-size and leaves every other row unwritten,
+    so no downstream index changes meaning and there is no second partition to
+    keep in step with this one.
+
+    None means "compute every row" -- the replicated path -- and is returned
+    whenever the rows that will be read are not covered by the chunks:
+
+    * ``num_decodes > 0``: the decode branch reads ``q_quant[:num_decode_tokens]``
+      and ``weights[:batch * next_n]``, ranges no chunk names (and the latter can
+      run past the decode region);
+    * no chunks, or ANY of them lacks ``shard_row_counts`` -- the whole batch
+      replicated (tp=1, DCP, PCP, under MIN_SHARD_TOKENS) or a mixed batch
+      where a sub-chunk with fewer rows than ranks stayed replicated; either
+      way some chunk needs every row, so the Q path computes every row;
+    * a chunk naming a row beyond ``num_tokens``, which would silently truncate.
+    """
+    if num_decodes > 0 or not chunks:
+        return None
+    if any(c.shard_row_counts is None for c in chunks):
+        return None
+
+    ranges: list[tuple[int, int]] = []
+    for c in chunks:
+        if c.token_end <= c.token_start:
+            continue
+        if c.token_start < 0 or c.token_end > num_tokens:
+            return None
+        if ranges and ranges[-1][1] == c.token_start:
+            ranges[-1] = (ranges[-1][0], c.token_end)
+        else:
+            ranges.append((c.token_start, c.token_end))
+    return ranges or None
 
 
 class PrepareUniformDecodeKernel(
@@ -285,6 +466,8 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     local_cu_seq_lens: torch.Tensor | None = None
     local_total_seq_lens: int = 0
     max_local_total_seq_lens: int = 0
+    shard_row_counts: list[int] | None = None
+    gather_token_start: int | None = None
 
 
 class BuildPrefillChunkMetadataKernel(
@@ -483,6 +666,7 @@ class BuildPrefillChunkMetadataKernel(
 @dataclass
 class DeepseekV32IndexerPrefillMetadata:
     chunks: list[DeepseekV32IndexerPrefillChunkMetadata]
+    q_row_ranges: list[tuple[int, int]] | None = None
 
 
 @dataclass
@@ -498,6 +682,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     schedule_metadata: torch.Tensor
     global_seq_lens: torch.Tensor | None = None
     indices: torch.Tensor | None = None
+    shard_bounds: tuple[int, int] | None = None
 
 
 @dataclass
@@ -597,6 +782,35 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.indexer_shard_size = 1
+        self.indexer_shard_rank = 0
+        self.decode_shard_min_reqs = 0
+        if envs.VLLM_INDEXER_QUERY_SHARD:
+            tp = get_tp_group()
+            if indexer_shard_is_eligible(
+                tp.world_size, self.dcp_world_size, self.use_pcp
+            ):
+                self.indexer_shard_size = tp.world_size
+                self.indexer_shard_rank = tp.rank_in_group
+                self.decode_shard_min_reqs = envs.VLLM_INDEXER_DECODE_SHARD_MIN_REQS
+                logger.info_once(
+                    "Indexer query-sharding ENABLED: prefill rows split across "
+                    "%d TP ranks (>= %d tokens); top-k all-gathered per chunk. "
+                    "Decode query groups split at >= %s decode requests "
+                    "(0 = decode half disabled); top-k all-reduced per layer.",
+                    self.indexer_shard_size,
+                    MIN_SHARD_TOKENS,
+                    self.decode_shard_min_reqs,
+                )
+            else:
+                logger.info_once(
+                    "Indexer query-sharding INACTIVE (replicated): tp_size=%d, "
+                    "dcp_world_size=%d, use_pcp=%s (requires tp_size>1, "
+                    "dcp_world_size==1, use_pcp=False).",
+                    tp.world_size,
+                    self.dcp_world_size,
+                    self.use_pcp,
+                )
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
         # so fail closed here rather than silently produce wrong output.
@@ -969,11 +1183,23 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 request_offset=num_decodes,
             )
 
+            num_prefill_tokens = int(
+                query_start_loc_cpu[num_decodes + num_prefills]
+                - query_start_loc_cpu[num_decodes]
+            )
+            shard_size = indexer_shard_size_for_batch(
+                num_prefill_tokens, self.indexer_shard_size
+            )
+            shard_rank = self.indexer_shard_rank if shard_size > 1 else 0
+            sharded_specs = shard_chunk_specs_by_query(
+                chunk_specs, shard_rank, shard_size
+            )
+
             chunks = []
-            for req_slice, query_slice in chunk_specs:
+            for spec in sharded_specs:
                 metadata = build_prefill_chunk_metadata(
-                    req_slice.start,
-                    req_slice.stop,
+                    spec.req_slice.start,
+                    spec.req_slice.stop,
                     query_start_loc,
                     query_start_loc_cpu,
                     seq_lens,
@@ -981,16 +1207,25 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     compressed_seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
                     self.compress_ratio,
-                    query_slice=query_slice,
-                    skip_kv_gather=query_slice.start > 0,
+                    query_slice=spec.query_slice,
+                    skip_kv_gather=spec.skip_kv_gather,
                     dcp_rank=self.dcp_rank,
                     dcp_world_size=self.dcp_world_size,
                     cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
                 )
-                # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
+                    metadata.shard_row_counts = spec.shard_row_counts
+                    if spec.gather_start is not None:
+                        metadata.gather_token_start = metadata.token_start - (
+                            spec.query_slice.start - spec.gather_start
+                        )
                     chunks.append(metadata)
-            prefill_metadata = DeepseekV32IndexerPrefillMetadata(chunks)
+            prefill_metadata = DeepseekV32IndexerPrefillMetadata(
+                chunks,
+                q_row_ranges=indexer_q_row_ranges(
+                    chunks, num_decodes, common_attn_metadata.num_actual_tokens
+                ),
+            )
 
         decode_metadata = None
         if num_decodes > 0:
@@ -1064,6 +1299,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
             )
 
+            decode_shard_bounds = indexer_decode_shard_bounds(
+                batch_size,
+                num_decodes,
+                self.indexer_shard_rank,
+                self.indexer_shard_size,
+                self.decode_shard_min_reqs,
+            )
+
             seq_lens_is_buffer_view = not use_native or next_n > 1
 
             # DCP: localize the now-expanded per-token global bounds to this
@@ -1096,11 +1339,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
             if current_platform.is_cuda() and has_deep_gemm():
+                sched_seq_lens = seq_lens
+                sched_indices = decode_indices
+                if decode_shard_bounds is not None:
+                    lo, hi = decode_shard_bounds
+                    sched_seq_lens = seq_lens[lo:hi]
+                    if sched_indices is not None:
+                        sched_indices = sched_indices[lo:hi]
                 metadata = get_paged_mqa_logits_metadata(
-                    seq_lens,
+                    sched_seq_lens,
                     self.kv_cache_spec.num_states,
                     self.num_sms,
-                    indices=decode_indices,
+                    indices=sched_indices,
                 )
                 schedule_metadata = self.scheduler_metadata_buffer[: metadata.shape[0]]
                 schedule_metadata[:] = metadata
@@ -1113,6 +1363,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata=schedule_metadata,
                 indices=decode_indices,
                 global_seq_lens=global_seq_lens_for_decode,
+                shard_bounds=decode_shard_bounds,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

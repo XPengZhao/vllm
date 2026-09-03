@@ -9,7 +9,12 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode, get_current_vllm_config
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import (
+    get_dcp_group,
+    get_pcp_group,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -21,7 +26,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    is_deep_gemm_supported,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
@@ -32,8 +37,13 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
+    indexer_decode_shard_rows,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -43,6 +53,28 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _all_reduce_decode_topk(
+    topk_indices_buffer: torch.Tensor,
+    num_padded_tokens: int,
+    topk_tokens: int,
+    row_lo: int,
+    row_hi: int,
+    max_index: int,
+) -> torch.Tensor:
+    """Reassemble the decode top-k from every rank's owned rows via sum-AR."""
+    scattered = torch.zeros(
+        (num_padded_tokens, topk_tokens),
+        dtype=torch.float32,
+        device=topk_indices_buffer.device,
+    )
+    scattered[row_lo:row_hi] = topk_indices_buffer[row_lo:row_hi, :topk_tokens]
+    reduced = tensor_model_parallel_all_reduce(scattered)
+    topk_indices_buffer[:num_padded_tokens, :topk_tokens] = reduced.clamp_(
+        -1, max_index
+    )
+    return topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -496,9 +528,21 @@ def sparse_attn_indexer(
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                     )
-                else:
+                elif is_deep_gemm_supported():
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        clean_logits=False,
+                    )
+                else:
+                    assert not use_fp4_cache, (
+                        "Triton sparse-MLA fallback does not support FP4 KV cache"
+                    )
+                    logits = fp8_mqa_logits_triton(
+                        q_slice_cast,
                         (k_quant_cast, k_scale_cast),
                         weights[chunk.token_start : chunk.token_end],
                         cu_seqlen_ks,
@@ -526,6 +570,15 @@ def sparse_attn_indexer(
                 cp_kv_cache_interleave_size,
                 row_starts=chunk.cu_seqlen_ks,
             )
+
+            if chunk.shard_row_counts is not None:
+                gathered = get_tp_group().all_gatherv(
+                    topk_indices, dim=0, sizes=chunk.shard_row_counts
+                )
+                chunk_start = chunk.gather_token_start
+                topk_indices_buffer[
+                    chunk_start : chunk_start + gathered.shape[0], :topk_tokens
+                ] = gathered
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -575,15 +628,23 @@ def sparse_attn_indexer(
         batch_size = padded_q_quant_decode_tokens.shape[0]
         next_n = padded_q_quant_decode_tokens.shape[1]
         num_padded_tokens = batch_size * next_n
-        seq_lens = decode_metadata.seq_lens[:batch_size]
-        # seq_lens is always 2D: (B, next_n) for native spec decode, (B, 1)
-        # otherwise. deep_gemm fp8_fp4_paged_mqa_logits requires 2D context_lens;
-        # the downstream topk kernels accept both 1D and 2D.
-        padded_q_quant_cast = (
-            padded_q_quant_decode_tokens.view(torch.int8)
-            if use_fp4_cache
-            else padded_q_quant_decode_tokens
+        shard_bounds = decode_metadata.shard_bounds
+        group_lo, group_hi = shard_bounds or (0, batch_size)
+        row_lo, row_hi = indexer_decode_shard_rows(shard_bounds, batch_size, next_n)
+        seq_lens = decode_metadata.seq_lens[group_lo:group_hi]
+        block_table = decode_metadata.block_table[group_lo:group_hi]
+        shard_weights = weights[row_lo:row_hi]
+        padded_q_scale = (
+            padded_q_scale[group_lo:group_hi] if padded_q_scale is not None else None
         )
+        padded_q_quant_cast = (
+            padded_q_quant_decode_tokens[group_lo:group_hi].view(torch.int8)
+            if use_fp4_cache
+            else padded_q_quant_decode_tokens[group_lo:group_hi]
+        )
+        decode_indices = decode_metadata.indices
+        if decode_indices is not None and shard_bounds is not None:
+            decode_indices = decode_indices[group_lo:group_hi]
         if current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
@@ -593,26 +654,42 @@ def sparse_attn_indexer(
             logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
                 padded_q_quant_cast,
                 kv_cache,
-                weights[:num_padded_tokens],
+                shard_weights,
                 seq_lens_xpu,
-                decode_metadata.block_table,
+                block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len,
             )
-        else:
+        elif is_deep_gemm_supported():
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
-                weights[:num_padded_tokens],
+                shard_weights,
                 seq_lens,
-                decode_metadata.block_table,
+                block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
                 clean_logits=False,
-                indices=decode_metadata.indices,
+                indices=decode_indices,
+            )
+        else:
+            assert not use_fp4_cache, (
+                "Triton sparse-MLA fallback does not support FP4 KV cache"
+            )
+            seq_lens_triton = (
+                seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+            )
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                shard_weights,
+                seq_lens_triton,
+                block_table,
+                max_model_len=attn_metadata_narrowed.max_seq_len,
+                clean_logits=False,
             )
         num_rows = logits.shape[0]
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        topk_indices = topk_indices_buffer[row_lo:row_hi, :topk_tokens]
 
         use_cooperative_topk = (
             current_platform.is_cuda()
@@ -673,6 +750,16 @@ def sparse_attn_indexer(
                 dcp_rank,
                 dcp_world_size,
                 cp_kv_cache_interleave_size,
+            )
+
+        if shard_bounds is not None:
+            topk_indices = _all_reduce_decode_topk(
+                topk_indices_buffer,
+                num_padded_tokens,
+                topk_tokens,
+                row_lo,
+                row_hi,
+                attn_metadata_narrowed.max_seq_len,
             )
 
         if decode_metadata.requires_padding:
@@ -751,6 +838,7 @@ class SparseAttnIndexer(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        num_heads: int | None = None,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -774,11 +862,31 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            logger.warning_once(
+                "DeepGEMM not supported on this platform; "
+                "using Triton fallback for sparse attention indexer."
             )
+            # Prime the autotune caches here rather than in a warmup hook:
+            # memory profiling captures cudagraphs before any hook runs, and
+            # the autotuner's synchronizing benchmark is illegal under capture.
+            if num_heads is not None and not use_fp4_cache:
+                from vllm.v1.attention.ops.mqa_logits_triton import (
+                    warmup_fp8_mqa_logits_triton,
+                    warmup_fp8_paged_mqa_logits_triton,
+                )
+
+                device = topk_indices_buffer.device
+                warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
+                block_sizes = {
+                    64,
+                    256,
+                    get_current_vllm_config().cache_config.block_size,
+                }
+                for kernel_block_size in sorted(block_sizes):
+                    warmup_fp8_paged_mqa_logits_triton(
+                        num_heads, head_dim, kernel_block_size, device
+                    )
 
     @property
     def cp_kv_cache_interleave_size(self) -> int:
