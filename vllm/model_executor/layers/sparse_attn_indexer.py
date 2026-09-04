@@ -685,7 +685,7 @@ def sparse_attn_indexer(
                 shard_weights,
                 seq_lens_triton,
                 block_table,
-                max_model_len=attn_metadata_narrowed.max_seq_len,
+                max_model_len=decode_metadata.max_seq_len,
                 clean_logits=False,
             )
         num_rows = logits.shape[0]
@@ -759,7 +759,7 @@ def sparse_attn_indexer(
                 topk_tokens,
                 row_lo,
                 row_hi,
-                attn_metadata_narrowed.max_seq_len,
+                decode_metadata.max_seq_len,
             )
 
         if decode_metadata.requires_padding:
