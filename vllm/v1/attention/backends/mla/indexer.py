@@ -23,6 +23,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
+    is_deep_gemm_supported,
     native_next_n_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
@@ -683,6 +684,10 @@ class DeepSeekV32IndexerDecodeMetadata:
     global_seq_lens: torch.Tensor | None = None
     indices: torch.Tensor | None = None
     shard_bounds: tuple[int, int] | None = None
+    # Compressed decode KV width for V4 (uncompressed // compress_ratio).
+    # SM80 Triton paged-MQA logits sizes the output with this, not the
+    # parent metadata's uncompressed max_seq_len.
+    max_seq_len: int = 0
 
 
 @dataclass
@@ -1338,7 +1343,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if current_platform.is_cuda() and is_deep_gemm_supported():
                 sched_seq_lens = seq_lens
                 sched_indices = decode_indices
                 if decode_shard_bounds is not None:
@@ -1364,6 +1369,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 indices=decode_indices,
                 global_seq_lens=global_seq_lens_for_decode,
                 shard_bounds=decode_shard_bounds,
+                max_seq_len=(
+                    common_attn_metadata.max_seq_len // self.compress_ratio
+                ),
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

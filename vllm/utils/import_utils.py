@@ -601,6 +601,18 @@ def has_cutedsl() -> bool:
     return _has_module("cutlass")
 
 
+def is_cutedsl_supported() -> bool:
+    """Whether CuteDSL kernels can run on this device.
+
+    CuteDSL kernels target SM90+. Compiling them for an older arch aborts
+    the process, so package presence alone (``has_cutedsl()``) is not a
+    usable dispatch gate.
+    """
+    from vllm.platforms import current_platform
+
+    return has_cutedsl() and current_platform.has_device_capability(90)
+
+
 def has_humming() -> bool:
     """Whether the optional `humming` package is available."""
     return _has_module("humming")

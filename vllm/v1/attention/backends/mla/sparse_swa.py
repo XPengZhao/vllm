@@ -31,7 +31,11 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
+from vllm.v1.attention.ops.flashmla import (
+    FlashMLASchedMeta,
+    get_mla_metadata,
+    is_flashmla_sparse_supported,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -142,7 +146,14 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
-        if current_platform.is_rocm():
+        # ROCm and SM8x CUDA share the ragged Triton decode path, which
+        # never calls FlashMLA. SM8x would otherwise fall through to the
+        # FlashMLA SWA builder and crash at CUDA-graph capture.
+        use_triton_swa = current_platform.is_rocm() or (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(80)
+        )
+        if use_triton_swa:
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
             )
@@ -802,7 +813,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         call of each type. Subsequent same-type calls reuse the plan because
         the tensors (and ``have_initialized``) are populated on the struct.
 
-        Returns all-``None`` when there are no decode tokens this step, so
+        Returns all-``None`` when there are no decode tokens this step, or
+        when FlashMLA sparse is unavailable (ROCm, XPU, SM120, SM8x), so
         ``_forward_decode`` sees a clean sentinel.
         """
         out: dict[str, FlashMLASchedMeta | None] = {
@@ -815,6 +827,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            or not is_flashmla_sparse_supported()[0]
         ):
             return out
         for layer_type in self._layer_types:

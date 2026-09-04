@@ -289,6 +289,7 @@ def combine_case(
     query_lens: list[int],
     spans: list[list[tuple[int, int]]],
     with_image: bool,
+    max_image_tokens: int = MAX_IMG,
 ):
     """Run combine_topk_swa_indices and return (indices, lens, expected)."""
     device = torch.device("cuda")
@@ -313,7 +314,9 @@ def combine_case(
     topk_indices = topk_indices[:, : max(topk, 1)]
 
     if with_image:
-        lefts, rights = ref_left_right(seq_lens, query_lens, spans, MAX_IMG)
+        lefts, rights = ref_left_right(
+            seq_lens, query_lens, spans, max_image_tokens
+        )
         left_t = torch.tensor(lefts, dtype=torch.int32, device=device)
         right_t = torch.tensor(rights, dtype=torch.int32, device=device)
     else:
@@ -331,7 +334,7 @@ def combine_case(
         N,
         left_visible=left_t,
         right_visible=right_t,
-        max_image_tokens=MAX_IMG,
+        max_image_tokens=max_image_tokens,
     )
 
     # Reference rows.
@@ -339,10 +342,10 @@ def combine_case(
         seq_lens,
         query_lens,
         spans if with_image else [[] for _ in seq_lens],
-        MAX_IMG,
+        max_image_tokens,
     )
     topk_cpu = topk_indices.cpu()
-    width = WINDOW + MAX_IMG
+    width = WINDOW + max_image_tokens
     combined_topk = (topk + width + 127) // 128 * 128
     rows = []
     lens = []
@@ -354,6 +357,8 @@ def combine_case(
             pos = prefix_len + i
             topk_len = min((pos + 1) // compress_ratio, topk)
             start, end = ref_swa_bounds(pos, WINDOW, lefts[token], rights[token])
+            start = max(start, gather_start)
+            end = min(end, seq_len)
             swa_len = end - start
             row = [-1] * combined_topk
             for j in range(topk_len):
@@ -400,6 +405,22 @@ def test_combine_topk_swa_without_image_unchanged(cfg):
         case["query_lens"],
         case["spans"],
         with_image=False,
+    )
+    assert lens.cpu().tolist() == exp_lens
+    assert indices.cpu().tolist() == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_combine_topk_swa_clamps_image_span_to_gathered_prefix():
+    """A prefix-cache hit inside an image must not index before gathered KV."""
+    indices, lens, rows, exp_lens = combine_case(
+        compress_ratio=4,
+        topk=16,
+        seq_lens=[40],
+        query_lens=[4],
+        spans=[[(20, 39)]],
+        with_image=True,
+        max_image_tokens=12,
     )
     assert lens.cpu().tolist() == exp_lens
     assert indices.cpu().tolist() == rows

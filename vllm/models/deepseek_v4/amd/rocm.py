@@ -345,6 +345,18 @@ def uniform_decode_group_size(
     return group if bool((lens == group).all()) else 0
 
 
+def prefill_query_block_size_for_metadata(
+    num_heads: int,
+    head_dim: int,
+    compress_ratio: int,
+    has_image_visibility: bool,
+) -> int:
+    """Select query blocking only when its causal row derivation is valid."""
+    if compress_ratio != 128 or has_image_visibility:
+        return 0
+    return prefill_query_block_size(num_heads, head_dim)
+
+
 def _copy_ragged_to_graph_buffers(
     ragged_indices: torch.Tensor,
     ragged_indptr: torch.Tensor,
@@ -462,6 +474,10 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
     # Keep fused multi-step decode disabled until update_draft_decode_metadata()
     # also refreshes the ROCm-specific ragged SWA indices and indptrs.
     supports_draft_decode_metadata_update = False
+
+    def build_tile_scheduler(self, num_decode_tokens: int):
+        # Ragged Triton decode (ROCm and Ampere) never calls FlashMLA.
+        return super().build_tile_scheduler(0)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -940,6 +956,13 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         assert query_start_loc is not None
         prefill_token_base = query_start_loc_cpu[num_decodes]
 
+        left_visible = swa_metadata.prefill_left_visible
+        right_visible = swa_metadata.prefill_right_visible
+        if left_visible is not None:
+            assert right_visible is not None
+            left_visible = left_visible[num_decode_tokens:]
+            right_visible = right_visible[num_decode_tokens:]
+
         if not swa_only:
             if self.compress_ratio == 4:
                 assert self.topk_indices_buffer is not None
@@ -965,10 +988,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # Ratio-128 layers have no indexer: their index list is the positional
         # identity prefix plus the SWA window, so a query block can share a KV
         # tile. Ratio-4 top-k sets are per-query selections.
-        block_m = (
-            prefill_query_block_size(q.shape[1], q.shape[2])
-            if not swa_only and self.compress_ratio == 128
-            else 0
+        block_m = prefill_query_block_size_for_metadata(
+            q.shape[1],
+            q.shape[2],
+            self.compress_ratio,
+            left_visible is not None,
         )
 
         workspace_manager = current_workspace_manager()
@@ -1057,6 +1081,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 top_k,
                 M,
                 N,
+                left_visible=(
+                    left_visible[query_start:query_end]
+                    if left_visible is not None
+                    else None
+                ),
+                right_visible=(
+                    right_visible[query_start:query_end]
+                    if right_visible is not None
+                    else None
+                ),
+                max_image_tokens=self.max_image_tokens,
             )
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],

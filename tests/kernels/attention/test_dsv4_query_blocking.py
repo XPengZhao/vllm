@@ -21,7 +21,10 @@ tests here pin the two together, on CPU, without needing a GPU:
 import pytest
 import torch
 
-from vllm.models.deepseek_v4.amd.rocm import uniform_decode_group_size
+from vllm.models.deepseek_v4.amd.rocm import (
+    prefill_query_block_size_for_metadata,
+    uniform_decode_group_size,
+)
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_query_blocks,
     decode_block_tile,
@@ -344,6 +347,18 @@ def test_prefill_block_size_declines_shapes_the_kernel_cannot_mask(
     assert prefill_query_block_size(8, 512) == 8
     assert prefill_query_block_size(5, 512) == 0  # heads are not a whole tile
     assert prefill_query_block_size(8, 500) == 0  # head_dim is not a power of two
+    prefill_query_block_size.cache_clear()
+
+
+def test_prefill_blocking_declines_image_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image spans need per-query rows that the causal blocked path cannot derive."""
+    monkeypatch.setenv("VLLM_SPARSE_DENSE_QUERY_BLOCK", "8")
+    prefill_query_block_size.cache_clear()
+    assert prefill_query_block_size_for_metadata(8, 512, 128, False) == 8
+    assert prefill_query_block_size_for_metadata(8, 512, 128, True) == 0
+    assert prefill_query_block_size_for_metadata(8, 512, 4, False) == 0
     prefill_query_block_size.cache_clear()
 
 

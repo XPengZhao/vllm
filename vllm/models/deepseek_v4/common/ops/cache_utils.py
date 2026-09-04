@@ -29,7 +29,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
 
@@ -401,7 +401,7 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    if is_cutedsl_supported():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,
@@ -698,8 +698,13 @@ class CombineTopkSwaIndicesKernel(
                 left = 0
                 right = 0
             left_add = tl.maximum(left - (WINDOW_SIZE - 1), 0)
-            swa_start = tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, 0)
-            swa_len = pos + right - swa_start + 1
+            # Prefix caching may resume inside an image span. Restrict the
+            # widened window to rows that are present in the gathered workspace.
+            swa_start = tl.maximum(
+                tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, 0), gather_start
+            )
+            swa_end = tl.minimum(pos + right + 1, seq_len)
+            swa_len = tl.maximum(swa_end - swa_start, 0)
 
             offset = tl.arange(0, PADDED_TOP_K)
             mask = offset < topk_len
