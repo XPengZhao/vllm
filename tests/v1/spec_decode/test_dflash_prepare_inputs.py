@@ -24,6 +24,9 @@ def _run_prepare(
     cp_rank: int = 0,
     cp_size: int = 1,
     cp_interleave: int = 1,
+    enable_carry: bool = False,
+    num_rejected: int = 2,
+    max_model_len: int = 128,
 ):
     device = torch.device("cuda")
     max_num_reqs = 4
@@ -73,6 +76,14 @@ def _run_prepare(
     last_sampled = torch.tensor([0, 0, 99, 0], dtype=torch.int64, device=device)
     next_prefill_tokens = torch.zeros_like(last_sampled)
     block_table = torch.tensor([block_table_values], dtype=torch.int32, device=device)
+    carry_src = torch.full(
+        (max_num_reqs, num_speculative_steps - 1),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    carry_pos = torch.full_like(carry_src, -1, dtype=torch.int64)
+    carry_slot = torch.full_like(carry_src, -2, dtype=torch.int64)
 
     prepare_dflash_inputs(
         input_buffers,
@@ -86,7 +97,7 @@ def _run_prepare(
         seeds,
         input_batch,
         torch.tensor([1], dtype=torch.int32, device=device),
-        torch.tensor([2], dtype=torch.int32, device=device),
+        torch.tensor([num_rejected], dtype=torch.int32, device=device),
         last_sampled,
         next_prefill_tokens,
         input_temperature,
@@ -101,8 +112,12 @@ def _run_prepare(
         num_speculative_steps,
         max_num_reqs,
         max_num_tokens,
-        128,
+        max_model_len,
         sample_from_anchor=True,
+        carry_src=carry_src,
+        carry_pos=carry_pos,
+        carry_slot=carry_slot,
+        enable_carry=enable_carry,
     )
     torch.accelerator.synchronize()
     return SimpleNamespace(
@@ -115,6 +130,9 @@ def _run_prepare(
         sample_idx_mapping=sample_idx_mapping.cpu(),
         temperature=temperature.cpu(),
         seeds=seeds.cpu(),
+        carry_src=carry_src.cpu(),
+        carry_pos=carry_pos.cpu(),
+        carry_slot=carry_slot.cpu(),
     )
 
 
@@ -139,6 +157,33 @@ def test_prepare_dflash_inputs_excludes_rejected_context_suffix():
     assert out.sample_idx_mapping[:3].tolist() == [2, 2, 2]
     assert out.temperature[2].item() == 1.0
     assert out.seeds[2].item() == 17
+
+
+def test_prepare_dflash_inputs_recycles_suffix_after_first_rejection():
+    out = _run_prepare(
+        target_positions=[10, 11, 12, 13],
+        block_table_values=[0, 0, 7, 8, 9, 10, 11, 12],
+        enable_carry=True,
+        num_rejected=3,
+    )
+
+    assert out.carry_src[0].tolist() == [2, 3]
+    assert out.carry_pos[0].tolist() == [12, 13]
+    assert out.carry_slot[0].tolist() == [34, 35]
+    assert out.input_buffers.seq_lens[0].item() == 16
+
+
+def test_prepare_dflash_inputs_drops_carry_past_max_model_len():
+    out = _run_prepare(
+        target_positions=[124, 125, 126, 127],
+        block_table_values=list(range(1, 33)),
+        enable_carry=True,
+        num_rejected=3,
+        max_model_len=128,
+    )
+
+    assert out.carry_slot[0].tolist() == [PAD_SLOT_ID, PAD_SLOT_ID]
+    assert out.input_buffers.seq_lens[0].item() == 128
 
 
 def test_prepare_dflash_inputs_excludes_rejected_context_suffix_with_dcp():

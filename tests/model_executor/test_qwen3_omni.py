@@ -354,6 +354,32 @@ def test_qwen3_dspark_accepts_draft_vocab_at_least_target(draft_vocab_size):
 
 
 @pytest.mark.skip_global_cleanup
+def test_qwen3_dspark_enables_loaded_carry_embedding(monkeypatch):
+    from vllm.model_executor.models import qwen3_dspark as dspark_module
+
+    model = _dspark_vocab_stub(100, 100)
+    model.model.carry_loaded = False
+    model.model._build_fused_kv_buffers = Mock()
+    loaded_names = []
+
+    def fake_load_weights(_loader, weights, mapper=None):
+        del mapper
+        loaded_names.extend(name for name, _ in weights)
+
+    monkeypatch.setattr(
+        dspark_module.AutoWeightsLoader,
+        "load_weights",
+        fake_load_weights,
+    )
+    monkeypatch.setattr(dspark_module, "process_eagle_weight", Mock())
+
+    model.load_weights([("carry_embed", torch.zeros(8))])
+
+    assert model.model.carry_loaded
+    assert loaded_names == ["model.carry_embed"]
+
+
+@pytest.mark.skip_global_cleanup
 def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
     from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
 

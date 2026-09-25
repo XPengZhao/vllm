@@ -420,11 +420,12 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def _get_indexer_block_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        qsa_alignment = super()._get_indexer_block_alignment(vllm_config)
         index_kpool = getattr(
             vllm_config.model_config.hf_text_config, "index_kpool", None
         )
         if not index_kpool or index_kpool <= 1:
-            return None
+            return qsa_alignment
         from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 
         # kpool paged-MQA indexer: the storage block (block_size /
@@ -436,7 +437,13 @@ class CudaPlatformBase(Platform):
             # 64 for the fp8 indexer cache, so align to the largest pool
             # page here to make the page split land on 64 not the min 32.
             page = max(PAGED_MQA_PAGE_SIZES)
-        return index_kpool * page
+        kpool_alignment = index_kpool * page
+        if qsa_alignment is None:
+            return kpool_alignment
+
+        from math import lcm
+
+        return lcm(qsa_alignment, kpool_alignment)
 
     @classmethod
     def get_attn_backend_cls(

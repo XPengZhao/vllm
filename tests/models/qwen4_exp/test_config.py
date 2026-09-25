@@ -18,6 +18,7 @@ from vllm.models.qwen4_exp.config import (
     Qwen4ExpTextConfig,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+from vllm.platforms.interface import Platform
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from ...utils import spawn_new_process_for_each_test
@@ -46,6 +47,25 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "expected_alignment"),
+    [(0, 4), (1, 8), (7, 12), (9, 16)],
+)
+def test_qwen4_exp_qsa_block_alignment_includes_speculative_tail(
+    num_speculative_tokens: int, expected_alignment: int
+) -> None:
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(indexer_compress_ratio=4)
+        ),
+        num_speculative_tokens=num_speculative_tokens,
+    )
+
+    assert (
+        Platform._get_indexer_block_alignment(vllm_config) == expected_alignment
+    )
 
 
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
@@ -165,6 +185,44 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
                 )
         else:
             Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("method", ["mtp", "dspark", "ngram", "ngram_gpu"])
+def test_qwen4_exp_allows_supported_speculators(method: str) -> None:
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(ple_layer_ids=[]),
+            multimodal_config=None,
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, enable_dbo=False, ubatch_size=1
+        ),
+        speculative_config=SimpleNamespace(method=method),
+    )
+    with patch.object(
+        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    ):
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+def test_qwen4_exp_rejects_unsupported_speculator() -> None:
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(ple_layer_ids=[]),
+            multimodal_config=None,
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, enable_dbo=False, ubatch_size=1
+        ),
+        speculative_config=SimpleNamespace(method="eagle3"),
+    )
+    with (
+        patch.object(
+            Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+        ),
+        pytest.raises(NotImplementedError, match="supports only DSpark"),
+    ):
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:

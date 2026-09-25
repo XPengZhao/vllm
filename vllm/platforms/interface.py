@@ -807,12 +807,22 @@ class Platform:
     def _get_indexer_block_alignment(cls, vllm_config: "VllmConfig") -> int | None:
         """Extra ``block_size`` multiple a sparse indexer needs, else ``None``.
 
-        The CUDA kpool paged-MQA indexer virtually splits each storage block
-        into pool pages, so ``block_size`` must be a multiple of
-        ``index_kpool * min(PAGED_MQA_PAGE_SIZES)`` — implemented in the CUDA
-        platform override. Other platforms impose no extra constraint.
+        QSA keeps the speculative tail in a circular buffer whose capacity is
+        rounded up to a multiple of ``indexer_compress_ratio``. The attention
+        block must contain an integral number of those rings. Platform
+        overrides can combine this with additional indexer constraints.
         """
-        return None
+        compress_ratio = getattr(
+            vllm_config.model_config.hf_text_config,
+            "indexer_compress_ratio",
+            None,
+        )
+        if not compress_ratio or compress_ratio <= 0:
+            return None
+
+        num_speculative_tokens = vllm_config.num_speculative_tokens
+        span = compress_ratio + num_speculative_tokens
+        return compress_ratio * ((span + compress_ratio - 1) // compress_ratio)
 
     @classmethod
     def _align_hybrid_block_size(
@@ -945,6 +955,16 @@ class Platform:
                 # multiple of 128 so split kernel blocks keep that invariant.
                 kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
 
+        indexer_alignment_size = cls._get_indexer_block_alignment(vllm_config)
+        if indexer_alignment_size:
+            # Preserve every constraint at once. Rounding first to the backend
+            # multiple and then independently to the indexer multiple can
+            # break the former (for example, 832 -> 840 for alignments 16 and
+            # 12). Their LCM yields the correct minimum, 864 in that case.
+            kernel_block_alignment_size = lcm(
+                kernel_block_alignment_size, indexer_alignment_size
+            )
+
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf
             # TODO(tdoublep): this constraint can be relaxed fairly
@@ -963,9 +983,6 @@ class Platform:
                 mamba_page_size,
                 kernel_block_alignment_size * attn_page_size_1_token,
             )
-            indexer_align = cls._get_indexer_block_alignment(vllm_config)
-            if indexer_align:
-                attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size

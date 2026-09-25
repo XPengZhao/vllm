@@ -31,10 +31,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -389,7 +391,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "deepstack_input_embeds": 0,
     }
 )
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _HC_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -469,6 +471,7 @@ class Qwen4ExpModel(nn.Module):
             )
         else:
             self._mtp_hidden_buffer = None
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -482,7 +485,11 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> (
+        torch.Tensor
+        | IntermediateTensors
+        | tuple[torch.Tensor, list[torch.Tensor]]
+    ):
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -499,6 +506,7 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        aux_hidden_states: list[torch.Tensor] = []
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
@@ -512,6 +520,17 @@ class Qwen4ExpModel(nn.Module):
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
             )
+            if layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_multi_hidden = layer.mlp_hyper_connection.combine(
+                    hidden_states, block_output, injection
+                )
+                aux_hidden_states.append(
+                    aux_multi_hidden.unflatten(
+                        -1, (self.config.hc_count, self.config.hidden_size)
+                    )
+                    .mean(dim=-2, dtype=torch.float32)
+                    .to(aux_multi_hidden.dtype)
+                )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
             ):
@@ -558,6 +577,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -612,6 +633,7 @@ class Qwen4ExpForCausalLM(
     SupportsPP,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
+    SupportsEagle3,
 ):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
