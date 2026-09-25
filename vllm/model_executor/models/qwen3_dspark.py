@@ -317,7 +317,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             # t2d is training-only; the draft remaps via d2t at sampling time.
             if "t2d" in name:
                 continue
-            if "d2t" in name:
+            if name == "carry_embed" or name.endswith(".carry_embed"):
+                name = "model.carry_embed"
+                self.model.carry_loaded = True
+            elif "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
             elif "lm_head" not in name:

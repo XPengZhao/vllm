@@ -58,6 +58,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
         )
+        # Rejected suffix kept for the next draft after dropping its first row.
+        self.max_carry = max(self.num_speculative_steps - 1, 0)
+        self.carry_src = torch.zeros(
+            self.max_num_reqs, self.max_carry, dtype=torch.int32, device=device
+        )
+        self.carry_pos = torch.zeros(
+            self.max_num_reqs, self.max_carry, dtype=torch.int64, device=device
+        )
 
         from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
@@ -151,6 +159,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_idx_mapping.fill_(-1)
         # Capture must not write context K/V.
         self._context_slot_mappings.fill_(PAD_SLOT_ID)
+        self._carry_slot_mappings.fill_(PAD_SLOT_ID)
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
@@ -212,6 +221,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._context_slot_mappings = torch.zeros(
             len(self.draft_kv_cache_group_ids),
             self.max_num_tokens,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._carry_slot_mappings = torch.full(
+            (
+                len(self.draft_kv_cache_group_ids),
+                self.max_num_reqs,
+                self.max_carry,
+            ),
+            PAD_SLOT_ID,
             dtype=torch.int64,
             device=self.device,
         )
@@ -322,6 +341,33 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots,
         )
 
+    def _store_rejected_carry(
+        self, raw_hidden: torch.Tensor, num_reqs: int
+    ) -> None:
+        """Write this step's rejected suffix, minus its first row, as carry KV.
+
+        Storage slots sit just past the query block so the query forward does
+        not overwrite them. RoPE uses the positions where the target computed
+        those states. Rows whose block is not allocated stay PAD and are not
+        included in seq_lens.
+        """
+        if not hasattr(self.model, "project_carry_states"):
+            return
+        flat_src = self.carry_src[:num_reqs].reshape(-1).to(torch.long)
+        flat_pos = self.carry_pos[:num_reqs].reshape(-1)
+        safe_src = flat_src.clamp(min=0, max=raw_hidden.shape[0] - 1)
+        projected = self.model.project_carry_states(
+            raw_hidden.index_select(0, safe_src)
+        )
+        if self._layer_group_idx is not None:
+            carry_slots = [
+                self._carry_slot_mappings[gidx, :num_reqs].reshape(-1)
+                for gidx in self._layer_group_idx
+            ]
+        else:
+            carry_slots = self._carry_slot_mappings[0, :num_reqs].reshape(-1)
+        self.model.precompute_and_store_context_kv(projected, flat_pos, carry_slots)
+
     @torch.inference_mode()
     def propose(
         self,
@@ -353,6 +399,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
+        carry_enabled = bool(
+            getattr(getattr(self.model, "model", None), "carry_loaded", False)
+        )
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
@@ -362,12 +411,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
+        raw_hidden = (
+            torch.cat(aux_hidden_states, dim=-1)
+            if aux_hidden_states
+            else last_hidden_states
+        )
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            hidden_states = self.model.combine_hidden_states(raw_hidden)
         else:
-            hidden_states = last_hidden_states
+            hidden_states = raw_hidden
+            raw_hidden = None
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -430,6 +483,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens,
                 self.max_model_len,
                 self.sample_from_anchor,
+                self.carry_src,
+                self.carry_pos,
+                self._carry_slot_mappings[i],
+                carry_enabled,
             )
 
         batch_sync, num_batch_tokens = (
@@ -470,6 +527,14 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self._precompute_context_kv(num_context, num_target_tokens)
         else:
             self._precompute_context_kv(0, num_target_tokens, dummy_run)
+
+        if (
+            not dummy_run
+            and raw_hidden is not None
+            and self.max_carry > 0
+            and carry_enabled
+        ):
+            self._store_rejected_carry(raw_hidden[:num_target_tokens], num_reqs)
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
@@ -521,6 +586,9 @@ def _prepare_dflash_inputs_kernel(
     out_sample_idx_mapping_ptr,
     out_temperature_ptr,
     out_seeds_ptr,
+    out_carry_src_ptr,
+    out_carry_pos_ptr,
+    out_carry_slot_ptr,
     # Inputs from target batch
     target_positions_ptr,
     target_query_start_loc_ptr,
@@ -549,6 +617,8 @@ def _prepare_dflash_inputs_kernel(
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    MAX_CARRY: tl.constexpr,
+    ENABLE_CARRY: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -663,9 +733,53 @@ def _prepare_dflash_inputs_kernel(
         # seq_lens is the absolute sequence length the draft attention
         # reads up to (context + query), not just the count of accepted
         # tokens this step.
+        # Drop the first rejected row. Keep the rest as temporary carry,
+        # stored just past this step's query so the query KV write does not
+        # overwrite it. A missing block truncates the suffix.
+        num_keep = 0
+        if ENABLE_CARRY and MAX_CARRY > 0:
+            num_carry = tl.maximum(num_rejected - 1, 0)
+            carry_base = req_idx * MAX_CARRY
+            open_carry = 1
+            for carry_i in range(MAX_CARRY):
+                want = (carry_i < num_carry) & (open_carry != 0)
+                src = valid_ctx_end + 1 + carry_i
+                rope_pos = tl.load(target_positions_ptr + src, mask=want, other=0)
+                store_pos = last_valid_pos + num_query_per_req + 1 + carry_i
+                store_block_num = store_pos // (block_size * CP_SIZE)
+                want = (
+                    want
+                    & (store_pos < max_model_len)
+                    & (store_block_num < block_table_stride)
+                )
+                store_block_num = tl.minimum(store_block_num, block_table_stride - 1)
+                store_block_id = tl.load(
+                    block_table_ptr + req_idx * block_table_stride + store_block_num,
+                    mask=want,
+                    other=0,
+                ).to(tl.int64)
+                resident = want & (store_block_id != 0)
+                local_carry_slot = cp_local_slot(
+                    store_pos,
+                    store_block_id,
+                    block_size,
+                    cp_rank,
+                    CP_SIZE,
+                    CP_INTERLEAVE,
+                    PAD_SLOT_ID,
+                )
+                kept = tl.where(resident, 1, 0)
+                carry_slot = tl.where(resident, local_carry_slot, PAD_SLOT_ID)
+                tl.store(out_carry_src_ptr + carry_base + carry_i, src)
+                tl.store(out_carry_pos_ptr + carry_base + carry_i, rope_pos)
+                tl.store(out_carry_slot_ptr + carry_base + carry_i, carry_slot)
+                open_carry = kept
+                num_keep += kept
         tl.store(
             out_seq_lens_ptr + req_idx,
-            tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len),
+            tl.minimum(
+                last_valid_pos + 1 + num_query_per_req + num_keep, max_model_len
+            ),
         )
         # Copy sampling state.
         tl.store(
@@ -742,6 +856,10 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    carry_src: torch.Tensor | None = None,
+    carry_pos: torch.Tensor | None = None,
+    carry_slot: torch.Tensor | None = None,
+    enable_carry: bool = False,
 ) -> None:
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
@@ -764,6 +882,9 @@ def prepare_dflash_inputs(
         sample_idx_mapping,
         temperature,
         seeds,
+        carry_src,
+        carry_pos,
+        carry_slot,
         input_batch.positions,
         input_batch.query_start_loc,
         input_batch.idx_mapping,
@@ -788,4 +909,6 @@ def prepare_dflash_inputs(
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+        MAX_CARRY=0 if carry_src is None else carry_src.shape[1],
+        ENABLE_CARRY=enable_carry,
     )

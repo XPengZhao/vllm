@@ -450,6 +450,15 @@ class DFlashQwen3Model(nn.Module):
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
             )
+            # Added to rejected target features before `fc`. Zero until a
+            # carryover checkpoint loads a trained value.
+            self.carry_embed = nn.Parameter(
+                torch.zeros(
+                    self.fc.input_size,
+                    dtype=vllm_config.model_config.dtype,
+                )
+            )
+            self.carry_loaded = False
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -812,6 +821,18 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             result = result.squeeze(0)
         return result
 
+    def project_carry_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project rejected target features after adding the carry marker.
+
+        ``hidden_states`` is the raw concatenated aux features, same layout
+        as ``combine_hidden_states`` input. The marker is applied only to
+        these rows, then the shared ``fc`` runs.
+        """
+        if not hasattr(self.model, "carry_embed"):
+            raise RuntimeError("This drafter has no carry embedding.")
+        marked = hidden_states + self.model.carry_embed.to(dtype=hidden_states.dtype)
+        return self.model.fc(marked)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}
         includes_draft_id_mapping = False
@@ -824,7 +845,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
             if "t2d" in name:
                 continue
-            if "d2t" in name:
+            if name == "carry_embed" or name.endswith(".carry_embed"):
+                name = "model.carry_embed"
+                if hasattr(self.model, "carry_loaded"):
+                    self.model.carry_loaded = True
+            elif "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
             elif "lm_head" not in name:
