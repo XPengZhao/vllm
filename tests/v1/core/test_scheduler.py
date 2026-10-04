@@ -591,6 +591,124 @@ def test_no_mm_input_chunking():
         )
 
 
+@pytest.mark.parametrize(
+    ("computed", "image_start", "image_end", "expected"),
+    [
+        (0, 200, 400, 128),  # Future image.
+        (0, 128, 400, 128),  # Exactly at the image start.
+        (0, 100, 400, 512),  # Strictly inside the image.
+        (0, 100, 128, 128),  # Exactly at the image end.
+        (0, 10, 100, 128),  # Text following the image in this chunk.
+        (400, 100, 300, 128),  # Image from an earlier chunk.
+    ],
+)
+def test_mm_soft_prefill_limit_only_yields_to_image_interior(
+    computed, image_start, image_end, expected
+):
+    """Keep the text chunking limit unless its cutoff would split an image."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.scheduler_config = SchedulerConfig(
+        long_prefill_token_threshold=128, disable_chunked_mm_input=True
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=1024,
+        mm_positions=[
+            [PlaceholderRange(offset=image_start, length=image_end - image_start)]
+        ],
+    )[0]
+    assert scheduler._apply_prefill_token_threshold(request, computed, 512) == expected
+
+
+@pytest.mark.parametrize("cached_encoder", [False, True])
+@pytest.mark.parametrize("start_pos", [0, 400])
+def test_no_mm_input_chunking_at_cached_image_boundary(cached_encoder, start_pos):
+    """A cached encoder must not let a decoder chunk split an image."""
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=1024,
+        disable_chunked_mm_input=True,
+        max_model_len=2048,
+        long_prefill_token_threshold=128,
+    )
+    requests = create_requests(num_requests=1, num_tokens=400, req_ids=["text"])
+    image_request = create_requests(
+        num_requests=1,
+        num_tokens=start_pos + 800,
+        req_ids=["image"],
+        mm_positions=[[PlaceholderRange(offset=start_pos, length=800)]],
+    )[0]
+    if cached_encoder:
+        scheduler.encoder_cache_manager.allocate(image_request, 0)
+    # Leave only 624 tokens of hard batch capacity, fewer than one image.
+    scheduler.scheduler_config.long_prefill_token_threshold = 0
+    scheduler.add_request(requests[0])
+    scheduler.add_request(image_request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens.get("image", 0) == start_pos
+    req_ids = list(output.num_scheduled_tokens)
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=[[] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # Once a full batch is available, the soft text cap must not starve images.
+    scheduler.finish_requests("text", RequestStatus.FINISHED_STOPPED)
+    scheduler.scheduler_config.long_prefill_token_threshold = 128
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["image"] == 800
+
+
+def test_no_mm_input_chunking_for_repeated_image():
+    """Reusing an image within the batch still requires an atomic decoder span."""
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=1024,
+        disable_chunked_mm_input=True,
+        max_model_len=2048,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=1200,
+        mm_positions=[
+            [
+                PlaceholderRange(offset=0, length=600),
+                PlaceholderRange(offset=600, length=600),
+            ]
+        ],
+        mm_hashes_list=[["same-image", "same-image"]],
+    )[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[request.request_id] == 600
+
+
+def test_prefill_lookahead_does_not_cut_image_tail():
+    """MTP's trailing-token reserve must run before the image boundary check."""
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=1024,
+        disable_chunked_mm_input=True,
+        max_model_len=2048,
+    )
+    scheduler.num_prefill_lookahead = 3
+    request = create_requests(
+        num_requests=1,
+        num_tokens=1025,
+        mm_positions=[[PlaceholderRange(offset=400, length=624)]],
+    )[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[request.request_id] == 397
+
+
 @pytest.mark.parametrize("enable_prefix_caching", [True, False])
 def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     """Test scheduling behavior with concurrent partial requests.

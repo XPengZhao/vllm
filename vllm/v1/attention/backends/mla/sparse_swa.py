@@ -188,6 +188,8 @@ class DeepseekSparseSWAMetadata:
     # None when the model is text-only or the batch has no image spans.
     prefill_left_visible: torch.Tensor | None = None
     prefill_right_visible: torch.Tensor | None = None
+    # CPU dispatch hint, one entry per prefill request (not per token).
+    prefill_has_image_tokens: list[bool] | None = None
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -624,6 +626,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # atomically), so the decode path above never needs them.
         prefill_left_visible: torch.Tensor | None = None
         prefill_right_visible: torch.Tensor | None = None
+        prefill_has_image_tokens: list[bool] | None = [False] * num_prefills
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
         if (
             self.max_image_tokens > 0
@@ -631,15 +634,44 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             and mm_ranges
             and any(mm_ranges.values())
         ):
-            prefill_left_visible, prefill_right_visible = self._build_image_visibility(
-                common_attn_metadata.num_reqs,
-                mm_ranges,
-                num_decode_tokens,
-                num_prefill_tokens,
-                seq_lens,
-                query_start_loc,
-                token_to_req_indices,
-            )
+            if seq_lens_cpu is None:
+                prefill_has_image_tokens = None
+            else:
+                # The CPU upper bound is exact for prefill rows. Do not let
+                # images in past/future chunks or decode requests disable the
+                # text-only prefill path.
+                prefill_ends = seq_lens_cpu[
+                    num_decodes : num_decodes + num_prefills
+                ].tolist()
+                prefill_offsets = query_start_loc_cpu[
+                    num_decodes : num_decodes + num_prefills + 1
+                ].tolist()
+                prefill_has_image_tokens = [
+                    any(
+                        start < end and stop >= end - (q_end - q_start)
+                        for start, stop in mm_ranges.get(num_decodes + i, ())
+                    )
+                    for i, (end, q_start, q_end) in enumerate(
+                        zip(
+                            prefill_ends,
+                            prefill_offsets[:-1],
+                            prefill_offsets[1:],
+                            strict=True,
+                        )
+                    )
+                ]
+            if prefill_has_image_tokens is None or any(prefill_has_image_tokens):
+                prefill_left_visible, prefill_right_visible = (
+                    self._build_image_visibility(
+                        common_attn_metadata.num_reqs,
+                        mm_ranges,
+                        num_decode_tokens,
+                        num_prefill_tokens,
+                        seq_lens,
+                        query_start_loc,
+                        token_to_req_indices,
+                    )
+                )
 
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
@@ -705,6 +737,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             ),
             prefill_left_visible=prefill_left_visible,
             prefill_right_visible=prefill_right_visible,
+            prefill_has_image_tokens=prefill_has_image_tokens,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,

@@ -307,6 +307,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            is_mm_prefix_lm=self.model_config.is_mm_prefix_lm,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -485,6 +486,25 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def _apply_prefill_token_threshold(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if not 0 < threshold < num_new_tokens:
+            return num_new_tokens
+        if (
+            self.scheduler_config.disable_chunked_mm_input
+            and request.has_encoder_inputs
+        ):
+            chunk_end = num_computed_tokens + threshold
+            lo, hi = get_mm_features_in_window(
+                request.mm_features, start=chunk_end, end=chunk_end + 1
+            )
+            if lo < hi and request.mm_features[lo].mm_position.offset < chunk_end:
+                # Only bypass the soft cap when it would split an image.
+                return num_new_tokens
+        return threshold
+
     def _reserve_prefill_lookahead(
         self,
         request: Request,
@@ -595,8 +615,9 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            num_new_tokens = self._apply_prefill_token_threshold(
+                request, request.num_computed_tokens, num_new_tokens
+            )
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -616,6 +637,11 @@ class Scheduler(SchedulerInterface):
                     request, num_new_tokens
                 )
 
+            # Apply soft caps before preserving atomic multimodal spans.
+            num_new_tokens = self._reserve_prefill_lookahead(
+                request, request.num_computed_tokens, num_new_tokens
+            )
+
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
@@ -633,12 +659,6 @@ class Scheduler(SchedulerInterface):
                     encoder_compute_budget,
                     shift_computed_tokens=self.num_prefill_lookahead,
                 )
-
-            # Multi-module MTP: avoid ending a prefill chunk within
-            # num_prefill_lookahead of the prefill end.
-            num_new_tokens = self._reserve_prefill_lookahead(
-                request, request.num_computed_tokens, num_new_tokens
-            )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -989,9 +1009,9 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    num_new_tokens = self._apply_prefill_token_threshold(
+                        request, num_computed_tokens, num_new_tokens
+                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1029,6 +1049,10 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = 1
                             pad_spec_decode = False
 
+                    num_new_tokens = self._reserve_prefill_lookahead(
+                        request, num_computed_tokens, num_new_tokens
+                    )
+
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
                         (
@@ -1043,12 +1067,6 @@ class Scheduler(SchedulerInterface):
                             encoder_compute_budget,
                             shift_computed_tokens=self.num_prefill_lookahead,
                         )
-
-                    # Multi-module MTP: avoid ending a prefill chunk within
-                    # num_prefill_lookahead of the prefill end.
-                    num_new_tokens = self._reserve_prefill_lookahead(
-                        request, num_computed_tokens, num_new_tokens
-                    )
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
@@ -1682,25 +1700,12 @@ class Scheduler(SchedulerInterface):
                 # already calculated encoder inputs and can skip here.
                 continue
 
-            if not self.is_encoder_decoder:
-                # We are not using the encoder cache for encoder-decoder models,
-                # yet.
-                if item_identifier in mm_hashes_to_schedule:
-                    # The same encoder input has already been scheduled in the
-                    # current step.
-                    continue
-
-                if self.encoder_cache_manager.check_and_update_cache(request, i):
-                    # The encoder input is already computed and cached from a
-                    # previous step.
-                    continue
-
             # If no encoder input chunking is allowed, we do not want to
             # partially schedule a multimodal item. If the scheduled range would
             # only cover part of the mm input, roll back to before the mm item.
             if (
                 self.scheduler_config.disable_chunked_mm_input
-                and num_computed_tokens < start_pos
+                and num_computed_tokens <= start_pos
                 and (num_computed_tokens + num_new_tokens)
                 < (start_pos + num_encoder_tokens)
             ):
@@ -1711,6 +1716,14 @@ class Scheduler(SchedulerInterface):
                     0, start_pos - (num_computed_tokens + shift_computed_tokens)
                 )
                 break
+
+            if not self.is_encoder_decoder:
+                # Encoder reuse does not allow splitting a bidirectional span.
+                if item_identifier in mm_hashes_to_schedule:
+                    continue
+                if self.encoder_cache_manager.check_and_update_cache(request, i):
+                    continue
+
             if not self.encoder_cache_manager.can_allocate(
                 request, i, encoder_compute_budget, num_embeds_to_schedule
             ):
