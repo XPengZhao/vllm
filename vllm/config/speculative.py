@@ -1377,6 +1377,11 @@ class SpeculativeConfig:
                     self.draft_model_config.hf_config.architectures = [
                         "DSparkDraftModel"
                     ]
+                    # The MTP override above counts decoder layers, not tokens
+                    # in DSpark's parallel draft block.
+                    self.draft_model_config.hf_config.n_predict = getattr(
+                        self.draft_model_config.hf_config, "dspark_block_size", None
+                    )
                     self.draft_model_config.quantization = (
                         self.target_model_config.quantization
                     )

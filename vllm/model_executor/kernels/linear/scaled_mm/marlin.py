@@ -6,15 +6,18 @@ from collections.abc import Sequence
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_weight_block_strategy,
 )
+from vllm.model_executor.layers.quantization.utils.int8_utils import block_dequant
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     is_fp8_marlin_supported,
     prepare_fp8_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
     kFp8Static128BlockSym,
 )
 from vllm.model_executor.utils import replace_parameter
@@ -24,6 +27,17 @@ from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
 )
+
+logger = init_logger(__name__)
+
+
+def _dequant_excluded(layer: torch.nn.Module) -> bool:
+    patterns = [
+        p.strip() for p in envs.VLLM_MARLIN_FP8_DEQUANT_EXCLUDE.split(",") if p.strip()
+    ]
+    return is_layer_skipped(
+        getattr(layer, "prefix", ""), patterns, match_mode="substring"
+    )
 
 
 class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
@@ -81,11 +95,45 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             # Same exemption the deep_gemm and xpu kernels make.
             return
 
+        if envs.VLLM_MARLIN_FP8_DEQUANT_BF16 and not _dequant_excluded(layer):
+            if self.block_quant:
+                self._dequantize_layer_for_cublas(layer)
+                return
+            logger.warning_once(
+                "VLLM_MARLIN_FP8_DEQUANT_BF16 applies only to block-quantized "
+                "FP8 layers; falling back to Marlin for this layer."
+            )
+
         layer.input_scale = None
         prepare_fp8_layer_for_marlin(
             layer, self.size_k_first, input_dtype=self.marlin_input_dtype
         )
         del layer.input_scale
+
+    def _dequantize_layer_for_cublas(self, layer: torch.nn.Module) -> None:
+        """Trade FP8 weight storage for model-dtype linear execution."""
+        weight = layer.weight
+        scale_name = self._block_scale_name(layer)
+        weight_scale = getattr(layer, scale_name)
+        weight_dq = block_dequant(
+            weight, weight_scale.to(torch.float32), layer.weight_block_size
+        ).to(layer.orig_dtype)
+        freed = weight.nbytes + weight_scale.nbytes
+        replace_parameter(layer, "weight", weight_dq)
+        delattr(layer, scale_name)
+        layer.marlin_fp8_dequant = True
+        logger.warning_once(
+            "VLLM_MARLIN_FP8_DEQUANT_BF16 expands block-FP8 dense weights "
+            "to the model dtype, increasing weight memory and reducing "
+            "available KV-cache capacity."
+        )
+        logger.debug(
+            "FP8->%s dequant for %s: freed %d B, allocated %d B",
+            layer.orig_dtype,
+            getattr(layer, "prefix", ""),
+            freed,
+            weight_dq.nbytes,
+        )
 
     def apply_weights(
         self,
@@ -93,6 +141,8 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "marlin_fp8_dequant", False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
         if self.block_quant:
             weight_scale = getattr(layer, self._block_scale_name(layer))
         else:

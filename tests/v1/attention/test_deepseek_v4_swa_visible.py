@@ -16,6 +16,9 @@ import torch
 from typing_extensions import TypedDict
 
 from tests.v1.attention.utils import create_vllm_config
+from vllm.models.deepseek_v4.amd.rocm import (
+    combine_topk_swa_indices as combine_topk_swa_indices_triton,
+)
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     build_flashinfer_mixed_sparse_indices,
     combine_topk_swa_indices,
@@ -204,6 +207,12 @@ CASES: list[_Case] = [
         "query_lens": [7, 15],
         "spans": [[(0, 6)], [(10, 14)]],
     },
+    # A compressed row appears inside the image for ratio-128 layers.
+    {
+        "seq_lens": [270, 150],
+        "query_lens": [160, 20],
+        "spans": [[(126, 140)], []],
+    },
 ]
 
 
@@ -290,6 +299,7 @@ def combine_case(
     spans: list[list[tuple[int, int]]],
     with_image: bool,
     max_image_tokens: int = MAX_IMG,
+    combine_impl=combine_topk_swa_indices,
 ):
     """Run combine_topk_swa_indices and return (indices, lens, expected)."""
     device = torch.device("cuda")
@@ -309,20 +319,18 @@ def combine_case(
     M = N + int(gather_lens.max()) + 8
     gen = torch.Generator(device="cpu").manual_seed(0)
     topk_indices = torch.randint(
-        0, 4096, (num_tokens, max(topk, 1)), generator=gen, dtype=torch.int32
+        0, N, (num_tokens, max(topk, 1)), generator=gen, dtype=torch.int32
     ).to(device)
     topk_indices = topk_indices[:, : max(topk, 1)]
 
     if with_image:
-        lefts, rights = ref_left_right(
-            seq_lens, query_lens, spans, max_image_tokens
-        )
+        lefts, rights = ref_left_right(seq_lens, query_lens, spans, max_image_tokens)
         left_t = torch.tensor(lefts, dtype=torch.int32, device=device)
         right_t = torch.tensor(rights, dtype=torch.int32, device=device)
     else:
         left_t = right_t = None
 
-    combined_indices, combined_lens = combine_topk_swa_indices(
+    combined_indices, combined_lens = combine_impl(
         topk_indices,
         query_start_loc,
         seq_lens_t,
@@ -374,13 +382,19 @@ def combine_case(
 COMBINE_CASES = [
     dict(compress_ratio=1, topk=0),  # SWA-only layer
     dict(compress_ratio=4, topk=16),  # C4A layer
+    dict(compress_ratio=128, topk=16),  # C128A layer
 ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "combine_impl",
+    [combine_topk_swa_indices, combine_topk_swa_indices_triton],
+    ids=["shared", "ampere_rocm"],
+)
 @pytest.mark.parametrize("cfg", COMBINE_CASES)
-def test_combine_topk_swa_with_image_spans(cfg):
-    case = CASES[0]
+@pytest.mark.parametrize("case", CASES)
+def test_combine_topk_swa_with_image_spans(combine_impl, cfg, case):
     indices, lens, rows, exp_lens = combine_case(
         cfg["compress_ratio"],
         cfg["topk"],
@@ -388,14 +402,20 @@ def test_combine_topk_swa_with_image_spans(cfg):
         case["query_lens"],
         case["spans"],
         with_image=True,
+        combine_impl=combine_impl,
     )
     assert lens.cpu().tolist() == exp_lens
     assert indices.cpu().tolist() == rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "combine_impl",
+    [combine_topk_swa_indices, combine_topk_swa_indices_triton],
+    ids=["shared", "ampere_rocm"],
+)
 @pytest.mark.parametrize("cfg", COMBINE_CASES)
-def test_combine_topk_swa_without_image_unchanged(cfg):
+def test_combine_topk_swa_without_image_unchanged(combine_impl, cfg):
     """left_visible=None must reproduce the plain causal combined indices."""
     case = CASES[0]
     indices, lens, rows, exp_lens = combine_case(
@@ -405,14 +425,20 @@ def test_combine_topk_swa_without_image_unchanged(cfg):
         case["query_lens"],
         case["spans"],
         with_image=False,
+        combine_impl=combine_impl,
     )
     assert lens.cpu().tolist() == exp_lens
     assert indices.cpu().tolist() == rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_combine_topk_swa_clamps_image_span_to_gathered_prefix():
-    """A prefix-cache hit inside an image must not index before gathered KV."""
+@pytest.mark.parametrize(
+    "combine_impl",
+    [combine_topk_swa_indices, combine_topk_swa_indices_triton],
+    ids=["shared", "ampere_rocm"],
+)
+def test_combine_topk_swa_bounds_indices_to_gathered_workspace(combine_impl):
+    """Defensively bound truncated KV; the scheduler prevents partial images."""
     indices, lens, rows, exp_lens = combine_case(
         compress_ratio=4,
         topk=16,
@@ -421,9 +447,35 @@ def test_combine_topk_swa_clamps_image_span_to_gathered_prefix():
         spans=[[(20, 39)]],
         with_image=True,
         max_image_tokens=12,
+        combine_impl=combine_impl,
     )
     assert lens.cpu().tolist() == exp_lens
     assert indices.cpu().tolist() == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_triton_combine_widens_rows_without_reviving_invalid_topk():
+    """Image columns cross the 128-column boundary; invalid rows stay masked."""
+    device = torch.device("cuda")
+    indices, lens = combine_topk_swa_indices_triton(
+        torch.tensor([[-1, 99, 0, 1]], dtype=torch.int32, device=device),
+        torch.tensor([13, 14], dtype=torch.int32, device=device),
+        torch.tensor([200], dtype=torch.int32, device=device),
+        torch.tensor([200], dtype=torch.int32, device=device),
+        window_size=128,
+        compress_ratio=4,
+        topk=4,
+        M=300,
+        N=50,
+        left_visible=torch.tensor([199], dtype=torch.int32, device=device),
+        right_visible=torch.tensor([0], dtype=torch.int32, device=device),
+        max_image_tokens=384,
+    )
+    assert indices.shape == (1, 640)
+    assert lens.item() == 204
+    assert indices[0, :4].tolist() == [-1, -1, 0, 1]
+    assert indices[0, 4:204].tolist() == list(range(50, 250))
+    assert (indices[0, 204:] == -1).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -551,6 +603,7 @@ def test_builder_in_image_visibility():
     assert md.prefill_swa_indices.shape[-1] == WIDTH
     assert md.prefill_left_visible is not None
     assert md.prefill_right_visible is not None
+    assert md.prefill_has_image_tokens == [True, False]
 
     ref_left, ref_right = ref_left_right(seq_lens, query_lens, spans, MAX_IMG)
     assert md.prefill_left_visible.cpu().tolist() == ref_left
@@ -573,6 +626,7 @@ def test_builder_no_image_spans_fast_path():
     md = build_metadata(builder, seq_lens, query_lens, {0: [], 1: []})
     assert md.prefill_left_visible is None
     assert md.prefill_right_visible is None
+    assert md.prefill_has_image_tokens == [False, False]
 
     _, _, _, _, block_table = make_batch(seq_lens, query_lens, torch.device("cuda"))
     rows, lens = ref_swa_slot_rows(
@@ -580,6 +634,31 @@ def test_builder_no_image_spans_fast_path():
     )
     assert md.prefill_swa_lens.cpu().tolist() == lens
     assert md.prefill_swa_indices[:, 0].cpu().tolist() == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("has_current_image", [False, True])
+def test_builder_limits_image_visibility_to_scheduled_prefills(has_current_image):
+    """Past/future images and decode rows must not disable text query blocking."""
+    builder = make_builder(vision=True)
+    seq_lens = [50, 30, 30, 30]
+    query_lens = [1, 8, 8, 8]
+    spans = [
+        [(3, 8)],
+        [(4, 12)],
+        [(24, 29)] if has_current_image else [(0, 20)],
+        [(30, 40)],
+    ]
+    md = build_metadata(builder, seq_lens, query_lens, dict(enumerate(spans)))
+    assert md.num_decodes == 1
+    assert md.prefill_has_image_tokens == [False, has_current_image, False]
+    if has_current_image:
+        left, right = ref_left_right(seq_lens, query_lens, spans, MAX_IMG)
+        assert md.prefill_left_visible[1:].cpu().tolist() == left[1:]
+        assert md.prefill_right_visible[1:].cpu().tolist() == right[1:]
+    else:
+        assert md.prefill_left_visible is None
+        assert md.prefill_right_visible is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -592,6 +671,7 @@ def test_builder_text_model_unchanged():
     md = build_metadata(builder, seq_lens, query_lens, None)
     assert md.prefill_swa_indices.shape[-1] == WINDOW
     assert md.prefill_left_visible is None
+    assert md.prefill_has_image_tokens == [False, False]
 
     _, _, _, _, block_table = make_batch(seq_lens, query_lens, torch.device("cuda"))
     rows, lens = ref_swa_slot_rows(

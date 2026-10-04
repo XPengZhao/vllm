@@ -7,10 +7,14 @@ while keeping per-block content compact, so padding bytes at the end of each pag
 never addressed by the logical view.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.config.compilation import CUDAGraphMode
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
@@ -23,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     compute_layout_strides,
 )
 from vllm.v1.worker.gpu.attn_utils import (
+    compute_mm_prefix_ranges,
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
 )
@@ -31,6 +36,109 @@ from vllm.v1.worker.utils import (
     allocate_kv_cache,
     copy_kv_cache_blocks_inplace,
 )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+@pytest.mark.parametrize("clamp_in_kernel", [False, True])
+def test_mm_prefix_sentinel_span_includes_separators(offset, clamp_in_kernel):
+    """DeepSeek image rows attend across separators but not leading pad."""
+    pad = 3 - offset % 4
+    is_embed = torch.ones(384 + pad, dtype=torch.bool)
+    is_embed[: pad + 1] = False
+    is_embed[pad + 20] = False
+    is_embed[-1] = False
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(
+            offset=offset, length=len(is_embed), is_embed=is_embed
+        ),
+    )
+    result = compute_mm_prefix_ranges(
+        ["text", "image"],
+        {"image": [feature]},
+        sliding_window=128,
+        clamp_sliding_window=clamp_in_kernel,
+        span_leading_pad_modulus=4,
+    )
+    expected = [(offset + pad, offset + len(is_embed) - 1)] if clamp_in_kernel else []
+    assert result == {0: [], 1: expected}
+
+
+@pytest.mark.cpu_test
+def test_mm_prefix_default_keeps_embed_ranges_and_window_filter():
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(
+            offset=10,
+            length=6,
+            is_embed=torch.tensor([False, True, True, False, True, False]),
+        ),
+    )
+    features = {"req": [feature]}
+    assert compute_mm_prefix_ranges(["req"], features) == {0: [(11, 12), (14, 14)]}
+    assert compute_mm_prefix_ranges(["req"], features, sliding_window=1) == {
+        0: [(14, 14)]
+    }
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("cudagraph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_v2_prepare_attn_preserves_deepseek_image_span(monkeypatch, cudagraph_mode):
+    """Exercise the actual V2 entry point used by Vision + DSpark."""
+    from vllm.v1.worker.gpu.model_states import default as state_module
+
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(offset=0, length=387),
+    )
+    state = SimpleNamespace(
+        supports_mm_inputs=True,
+        model=SimpleNamespace(),
+        max_model_len=4096,
+        encoder_cache=SimpleNamespace(mm_features={"image": [feature]}),
+        model_config=SimpleNamespace(
+            is_mm_prefix_lm=True,
+            get_sliding_window=lambda: 128,
+            hf_text_config=SimpleNamespace(
+                mm_prefix_clamp_sliding_window=True,
+                mm_prefix_span_leading_pad_modulus=4,
+            ),
+        ),
+    )
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_reqs_after_padding=3,
+        num_tokens=400,
+        num_tokens_after_padding=416,
+        req_ids=["text", "image"],
+        query_start_loc_np=torch.tensor([0, 13, 400, 416], dtype=torch.int32).numpy(),
+        query_start_loc=torch.tensor([0, 13, 400, 416], dtype=torch.int32),
+        max_query_len=387,
+        seq_lens_cpu_upper_bound=torch.tensor([13, 387, 16]),
+        seq_lens=torch.tensor([13, 387, 16]),
+        dcp_local_seq_lens=None,
+        positions=None,
+        is_prefilling_np=torch.tensor([True, True, False]).numpy(),
+        prompt_lens=torch.tensor([13, 387, 0]),
+    )
+    monkeypatch.setattr(state_module, "build_attn_metadata", lambda **kwargs: kwargs)
+    metadata = state_module.DefaultModelState.prepare_attn(
+        state,
+        batch,
+        cudagraph_mode,
+        (),
+        torch.empty(0),
+        [],
+        None,
+    )
+    assert metadata["mm_req_doc_ranges"] == {0: [], 1: [(3, 386)]}
 
 
 class _FakeMetadataBuilder:

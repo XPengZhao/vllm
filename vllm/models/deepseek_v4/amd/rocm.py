@@ -109,11 +109,14 @@ def _combine_topk_swa_indices_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     gather_lens_ptr,
+    left_visible_ptr,
+    right_visible_ptr,
     M,
     N,
     TOP_K: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
+    IMAGE_WIDTH: tl.constexpr,
     TOPK_WIDTH: tl.constexpr,
     PADDED_TOP_K: tl.constexpr,
 ):
@@ -134,7 +137,18 @@ def _combine_topk_swa_indices_kernel(
         token_idx_in_query = token_idx - query_start
         pos = start_pos + token_idx_in_query
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        if IMAGE_WIDTH > 0:
+            left = tl.load(left_visible_ptr + token_idx)
+            right = tl.load(right_visible_ptr + token_idx)
+        else:
+            left = 0
+            right = 0
+        left_add = tl.maximum(left - (WINDOW_SIZE - 1), 0)
+        swa_start = tl.maximum(
+            tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, 0), gather_start
+        )
+        swa_end = tl.minimum(pos + right + 1, seq_len)
+        swa_len = tl.maximum(swa_end - swa_start, 0)
 
         topk_offset = tl.arange(0, PADDED_TOP_K)
         topk_mask = topk_offset < topk_len
@@ -152,15 +166,16 @@ def _combine_topk_swa_indices_kernel(
             mask=topk_mask,
         )
 
-        swa_offset = tl.arange(0, WINDOW_SIZE)
-        tl.store(
-            combined_indices_ptr
-            + token_idx * combined_indices_stride
-            + topk_len
-            + swa_offset,
-            M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start,
-            mask=swa_offset < swa_len,
-        )
+        for i in range(0, WINDOW_SIZE + IMAGE_WIDTH, WINDOW_SIZE):
+            swa_offset = i + tl.arange(0, WINDOW_SIZE)
+            tl.store(
+                combined_indices_ptr
+                + token_idx * combined_indices_stride
+                + topk_len
+                + swa_offset,
+                M * batch_idx + N + swa_start + swa_offset - gather_start,
+                mask=swa_offset < swa_len,
+            )
 
         tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
 
@@ -175,12 +190,19 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    left_visible: torch.Tensor | None = None,
+    right_visible: torch.Tensor | None = None,
+    max_image_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
+    has_image = left_visible is not None
+    image_width = max_image_tokens if has_image else 0
+    if has_image:
+        assert right_visible is not None
     combined_topk = (
-        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        (topk + window_size + image_width + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
         // _SPARSE_PREFILL_TOPK_ALIGNMENT
         * _SPARSE_PREFILL_TOPK_ALIGNMENT
     )
@@ -204,11 +226,14 @@ def combine_topk_swa_indices(
         query_start_loc,
         seq_lens,
         gather_lens,
+        left_visible if has_image else combined_lens,
+        right_visible if has_image else combined_lens,
         M,
         N,
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
+        IMAGE_WIDTH=image_width,
         TOPK_WIDTH=topk_indices.shape[-1],
         PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
     )
@@ -981,9 +1006,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             N = 0
 
         M = N + self.window_size + self.max_num_batched_tokens
-        num_chunks = (num_prefills + self.PREFILL_CHUNK_SIZE - 1) // (
-            self.PREFILL_CHUNK_SIZE
-        )
 
         # Ratio-128 layers have no indexer: their index list is the positional
         # identity prefix plus the SWA window, so a query block can share a KV
@@ -992,16 +1014,28 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             q.shape[1],
             q.shape[2],
             self.compress_ratio,
-            left_visible is not None,
+            False,
         )
+        has_image_tokens = swa_metadata.prefill_has_image_tokens
 
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
             ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
         )[0]
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
+        chunk_end = 0
+        while chunk_end < num_prefills:
+            chunk_start = chunk_end
             chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
+            if block_m and has_image_tokens is not None:
+                for req_idx in range(chunk_start + 1, chunk_end):
+                    if has_image_tokens[req_idx] != has_image_tokens[chunk_start]:
+                        chunk_end = req_idx
+                        break
+            chunk_has_image = (
+                any(has_image_tokens[chunk_start:chunk_end])
+                if has_image_tokens is not None
+                else left_visible is not None
+            )
             chunk_size = chunk_end - chunk_start
             if not swa_only:
                 assert attn_metadata is not None
@@ -1038,7 +1072,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            if block_m:
+            if block_m and not chunk_has_image:
                 chunk_qsl = query_start_loc_cpu[
                     num_decodes + chunk_start : num_decodes + chunk_end + 1
                 ]
@@ -1049,9 +1083,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     kv=kv.view(-1, 1, q.shape[-1]),
                     block_req=blocks[0],
                     block_qstart=blocks[1],
-                    query_start_loc=chunk_qsl.to(
-                        device=q.device, dtype=torch.int32
-                    ),
+                    query_start_loc=chunk_qsl.to(device=q.device, dtype=torch.int32),
                     seq_lens=seq_lens[chunk_start:chunk_end],
                     gather_lens=gather_lens[chunk_start:chunk_end],
                     scale=self.scale,
@@ -1083,12 +1115,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 N,
                 left_visible=(
                     left_visible[query_start:query_end]
-                    if left_visible is not None
+                    if chunk_has_image and left_visible is not None
                     else None
                 ),
                 right_visible=(
                     right_visible[query_start:query_end]
-                    if right_visible is not None
+                    if chunk_has_image and right_visible is not None
                     else None
                 ),
                 max_image_tokens=self.max_image_tokens,

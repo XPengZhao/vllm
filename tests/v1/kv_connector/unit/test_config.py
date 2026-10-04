@@ -103,6 +103,9 @@ def _build_config(
     kv_connector: str | None,
     enable_sleep_mode: bool = False,
     enable_cumem_allocator: bool = False,
+    model_type: str = "",
+    vision_n_layers: int = 0,
+    is_mm_prefix_lm: bool = False,
 ) -> VllmConfig:
     """Build a VllmConfig that exercises _verify_kv_transfer_compat without
     requiring a real model (avoids HF downloads in CI)."""
@@ -118,9 +121,41 @@ def _build_config(
     cfg.model_config = SimpleNamespace(
         enable_sleep_mode=enable_sleep_mode,
         enable_cumem_allocator=(enable_cumem_allocator or enable_sleep_mode),
+        hf_config=SimpleNamespace(
+            model_type=model_type, vision_n_layers=vision_n_layers
+        ),
+        is_mm_prefix_lm=is_mm_prefix_lm,
     )
     cfg._verify_kv_transfer_compat()
     return cfg
+
+
+@pytest.mark.parametrize(
+    ("model_type", "vision_n_layers", "is_mm_prefix_lm", "kv_connector", "reject"),
+    [
+        ("deepseek_v4", 32, True, "NixlConnector", True),
+        ("deepseek_v4", 32, True, None, False),
+        ("deepseek_v4", 0, False, "NixlConnector", False),
+        ("deepseek_v4", 32, False, "NixlConnector", False),
+        ("other_vision", 32, True, "NixlConnector", False),
+    ],
+)
+def test_deepseek_vision_requires_atomic_local_cache_hits(
+    monkeypatch, model_type, vision_n_layers, is_mm_prefix_lm, kv_connector, reject
+):
+    """Reject unsupported image-boundary recovery without disabling local APC."""
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    kwargs = dict(
+        model_type=model_type,
+        vision_n_layers=vision_n_layers,
+        is_mm_prefix_lm=is_mm_prefix_lm,
+        kv_connector=kv_connector,
+    )
+    if reject:
+        with pytest.raises(ValueError, match="DeepSeek-V4 vision"):
+            _build_config(**kwargs)
+    else:
+        _build_config(**kwargs)
 
 
 @pytest.mark.parametrize(

@@ -53,6 +53,85 @@ def _decode(u: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("draft_len", [3, 5])
+def test_dspark_noncausal_fp8_decode_keeps_future_tokens(draft_len):
+    """Exercise A100's draft index -> packed cache -> ragged attention path."""
+    from tests.kernels.attention.test_rocm_triton_attn_dsv4 import (
+        _pack_fp8_ds_mla_cache,
+        _ref_sparse_decode_ragged,
+    )
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL,
+    )
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        build_ragged_indices_from_dense,
+        rocm_sparse_attn_decode,
+    )
+
+    device = "cuda"
+    window, block_size, head_dim = 128, 64, 512
+    seq_len = window + draft_len
+    q = torch.zeros(draft_len + 1, 8, head_dim, dtype=torch.bfloat16, device=device)
+    q[..., 0] = 1
+    kv = torch.zeros(seq_len, head_dim, dtype=q.dtype, device=device)
+    kv[-1, :2] = torch.tensor([128.0, 16.0], device=device)
+    cache = _pack_fp8_ds_mla_cache(kv, block_size, use_fnuz=False)
+    indices = torch.empty(draft_len + 1, 1, 256, dtype=torch.int32, device=device)
+    lengths = torch.empty(draft_len + 1, dtype=torch.int32, device=device)
+    valid = torch.arange(draft_len + 1, device=device) < draft_len
+    _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL(
+        indices,
+        lengths,
+        window,
+        256,
+        torch.tensor([0, draft_len], dtype=torch.int32, device=device),
+        torch.tensor([seq_len], dtype=torch.int32, device=device),
+        torch.zeros(draft_len + 1, dtype=torch.int32, device=device),
+        valid,
+        torch.arange(3, dtype=torch.int32, device=device).reshape(1, 3),
+        block_size,
+        num_tokens=draft_len + 1,
+        token_offset=0,
+    )
+    torch.testing.assert_close(lengths, valid.int() * seq_len)
+    assert (indices[:draft_len, 0, seq_len - 1] == seq_len - 1).all()
+    assert (indices[-1] == -1).all()
+    ragged, indptr = build_ragged_indices_from_dense(indices[:, 0], lengths)
+    output = torch.empty_like(q)
+    rocm_sparse_attn_decode(
+        q=q,
+        kv_cache=None,
+        swa_k_cache=cache,
+        swa_only=True,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=indices,
+        swa_lens=lengths,
+        swa_ragged_indices=ragged,
+        swa_ragged_indptr=indptr,
+        topk_ragged_indices=None,
+        topk_ragged_indptr=None,
+        attn_sink=None,
+        scale=head_dim**-0.5,
+        head_dim=head_dim,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        output=output,
+    )
+    expected = _ref_sparse_decode_ragged(
+        q,
+        cache,
+        [list(range(seq_len))] * draft_len + [[]],
+        head_dim**-0.5,
+        None,
+        block_size,
+    )
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+    # The first query's causal alternative excludes the only nonzero KV row.
+    assert output[0, :, 1].min() > 1
+
+
 def _assert_bytes_equal(got: torch.Tensor, ref: torch.Tensor, inputs: torch.Tensor):
     if not torch.equal(got, ref):
         bad = (got != ref).nonzero()[:10].flatten()

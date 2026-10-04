@@ -200,10 +200,18 @@ class DefaultModelState(ModelState):
             and self.encoder_cache is not None
             and self.model_config.is_mm_prefix_lm
         ):
+            hf_text_config = self.model_config.hf_text_config
             req_doc_ranges = compute_mm_prefix_ranges(
                 req_ids=input_batch.req_ids,
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
+                clamp_sliding_window=getattr(
+                    self.model, "mm_prefix_clamp_sliding_window", False
+                )
+                or getattr(hf_text_config, "mm_prefix_clamp_sliding_window", False),
+                span_leading_pad_modulus=getattr(
+                    hf_text_config, "mm_prefix_span_leading_pad_modulus", 0
+                ),
             )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

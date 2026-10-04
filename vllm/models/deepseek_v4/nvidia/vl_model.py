@@ -72,8 +72,7 @@ def _make_deepseek_v4_vl_weights_mapper(
         },
         orig_to_new_substr={
             ".shared_experts.w2": ".shared_experts.down_proj",
-            # The MTP/DSpark draft heads are not supported for the vision
-            # variant; drop their weights.
+            # Draft heads are loaded separately by the speculative model.
             "mtp.": None,
         },
     )

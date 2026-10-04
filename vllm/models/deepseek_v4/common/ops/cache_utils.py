@@ -698,8 +698,8 @@ class CombineTopkSwaIndicesKernel(
                 left = 0
                 right = 0
             left_add = tl.maximum(left - (WINDOW_SIZE - 1), 0)
-            # Prefix caching may resume inside an image span. Restrict the
-            # widened window to rows that are present in the gathered workspace.
+            # Bound workspace addresses defensively. The scheduler must still
+            # keep image spans atomic; clipping is not a visibility substitute.
             swa_start = tl.maximum(
                 tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, 0), gather_start
             )

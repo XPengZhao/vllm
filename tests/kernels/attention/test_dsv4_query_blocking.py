@@ -18,9 +18,13 @@ tests here pin the two together, on CPU, without needing a GPU:
   per-query kernel.
 """
 
+from types import SimpleNamespace
+from unittest.mock import create_autospec
+
 import pytest
 import torch
 
+from vllm.models.deepseek_v4.amd import rocm
 from vllm.models.deepseek_v4.amd.rocm import (
     prefill_query_block_size_for_metadata,
     uniform_decode_group_size,
@@ -363,6 +367,119 @@ def test_prefill_blocking_declines_image_visibility(
 
 
 @pytest.mark.parametrize(
+    "compress_ratio,image_tokens,expected",
+    [
+        (1, [False, False, False], [("indexed", 0, 24)]),
+        (4, [False, True, False], [("indexed", 0, 24)]),
+        (128, [False, False, False], [("blocked", 0, 24)]),
+        (128, [True, False, False], [("indexed", 0, 8), ("blocked", 8, 16)]),
+        (
+            128,
+            [False, True, False],
+            [("blocked", 0, 8), ("indexed", 8, 8), ("blocked", 16, 8)],
+        ),
+        (128, None, [("indexed", 0, 24)]),
+    ],
+)
+def test_prefill_dispatch_keeps_text_requests_blocked(
+    monkeypatch: pytest.MonkeyPatch, compress_ratio, image_tokens, expected
+) -> None:
+    """Exercise the real forward dispatcher and local combine call contract."""
+    monkeypatch.setenv("VLLM_SPARSE_DENSE_QUERY_BLOCK", "8")
+    prefill_query_block_size.cache_clear()
+    q = torch.arange(24).view(24, 1, 1).expand(24, 8, 512)
+    output = torch.zeros_like(q)
+    visibility = torch.arange(25, dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 9, 17, 25], dtype=torch.int32)
+    block_table = torch.zeros(4, 1, dtype=torch.int32)
+    swa_metadata = rocm.DeepseekV4ROCMAiterSparseSWAMetadata(
+        block_table=block_table,
+        slot_mapping=torch.arange(25),
+        block_size=64,
+        num_prefills=3,
+        num_prefill_tokens=24,
+        num_decodes=1,
+        num_decode_tokens=1,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        prefill_seq_lens=torch.tensor([12, 12, 12]),
+        prefill_gather_lens=torch.tensor([12, 12, 12]),
+        prefill_left_visible=visibility,
+        prefill_right_visible=visibility,
+        prefill_has_image_tokens=image_tokens,
+    )
+    layer = SimpleNamespace(
+        compress_ratio=compress_ratio,
+        topk_indices_buffer=torch.zeros(25, 2, dtype=torch.int32),
+        max_model_len=256,
+        window_size=8,
+        max_num_batched_tokens=24,
+        max_image_tokens=384,
+        PREFILL_CHUNK_SIZE=4,
+        scale=1.0,
+        head_dim=512,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        attn_sink=None,
+    )
+    attn_metadata = SimpleNamespace(
+        c128a_prefill_topk_indices=layer.topk_indices_buffer[1:],
+        block_table=block_table,
+        block_size=256,
+    )
+    workspace = SimpleNamespace(
+        get_simultaneous=lambda *specs: [
+            torch.empty(shape, dtype=dtype) for shape, dtype in specs
+        ]
+    )
+    monkeypatch.setattr(rocm, "current_workspace_manager", lambda: workspace)
+    monkeypatch.setattr(rocm, "dequantize_and_gather_k_cache", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        rocm, "current_platform", SimpleNamespace(is_fp8_fnuz=lambda: False)
+    )
+    combine = create_autospec(
+        rocm.combine_topk_swa_indices,
+        return_value=(torch.empty(0), torch.empty(0)),
+    )
+    monkeypatch.setattr(rocm, "combine_topk_swa_indices", combine)
+    calls = []
+
+    def attention(path, **kwargs):
+        calls.append((path, int(kwargs["q"][0, 0, 0]), len(kwargs["q"])))
+        kwargs["output"].fill_(1)
+
+    monkeypatch.setattr(
+        rocm, "rocm_sparse_attn_prefill", lambda **kw: attention("indexed", **kw)
+    )
+    monkeypatch.setattr(
+        rocm,
+        "rocm_sparse_attn_prefill_blocked",
+        lambda **kw: attention("blocked", **kw),
+    )
+    rocm.DeepseekV4ROCMAiterMLAAttention._forward_prefill(
+        layer,
+        q,
+        torch.arange(24),
+        torch.empty(0),
+        torch.empty(0),
+        output,
+        attn_metadata if compress_ratio > 1 else None,
+        swa_metadata,
+    )
+    assert calls == expected
+    assert (output == 1).all()
+    for call, (_, start, length) in zip(
+        combine.call_args_list, [entry for entry in expected if entry[0] == "indexed"]
+    ):
+        left = call.kwargs["left_visible"]
+        if image_tokens is not None and not any(image_tokens):
+            assert left is None
+        else:
+            assert torch.equal(left, visibility[1 + start : 1 + start + length])
+    prefill_query_block_size.cache_clear()
+
+
+@pytest.mark.parametrize(
     # The decode tile defaults OFF: it measured 1.2-1.9x slower than the
     # per-query kernel at every residency (see `decode_query_block_size`), so
     # -1 keeps the old path and only an explicit width turns it on.
@@ -534,9 +651,7 @@ def test_blocked_decode_kernel_matches_the_per_query_kernel(
         for t in range(group):
             pos = depth + t
             swa_len = min(pos + 1, window)
-            main_rows.append(
-                [slot(req, p) for p in range(pos + 1 - swa_len, pos + 1)]
-            )
+            main_rows.append([slot(req, p) for p in range(pos + 1 - swa_len, pos + 1)])
             extra_rows.append(
                 [slot(req + 64, i) for i in range((pos + 1) // COMPRESS_RATIO)]
             )

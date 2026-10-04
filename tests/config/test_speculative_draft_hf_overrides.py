@@ -185,3 +185,45 @@ def test_mtp_index_share_override(
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
         is expected
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("vision_n_layers", [0, 32])
+@pytest.mark.parametrize("num_speculative_tokens", [None, 3, 5])
+def test_deepseek_dspark_block_size_is_not_mtp_layer_count(
+    vision_n_layers, num_speculative_tokens
+):
+    """Three draft decoder layers can predict a five-token DSpark block."""
+    hf_config = _make_hf_config(
+        architectures=["DeepseekV4ForCausalLM"],
+        model_type="deepseek_v4",
+        num_nextn_predict_layers=3,
+        dspark_block_size=5,
+        vision_n_layers=vision_n_layers,
+    )
+    hf_config = SpeculativeConfig.hf_config_override(hf_config)
+    assert hf_config.n_predict == 3
+    draft = MagicMock(
+        model="draft",
+        hf_config=hf_config,
+        architectures=hf_config.architectures,
+        max_model_len=4096,
+    )
+    draft.registry.inspect_model_cls.return_value = (MagicMock(), "DSparkDraftModel")
+    target = MagicMock(
+        model="target",
+        max_model_len=4096,
+        quantization=None,
+        hf_overrides={},
+    )
+    with patch("vllm.config.speculative.ModelConfig", return_value=draft):
+        config = SpeculativeConfig(
+            model="draft",
+            method="dspark",
+            num_speculative_tokens=num_speculative_tokens,
+            target_model_config=target,
+            target_parallel_config=ParallelConfig(),
+        )
+    assert config.num_speculative_tokens == (num_speculative_tokens or 5)
+    assert config.draft_model_config.hf_config.n_predict == 5
+    assert config.draft_model_config.hf_config.architectures == ["DSparkDraftModel"]

@@ -1862,6 +1862,53 @@ def test_mm_prefix_caching():
     assert num_computed_tokens == 3 * 16
 
 
+@pytest.mark.parametrize(
+    ("positions", "is_mm_prefix_lm", "expected_hit"),
+    [
+        ([], True, 96),
+        ([(40, 60)], False, 96),
+        ([(40, 60)], True, 32),
+        ([(0, 100)], True, 0),
+        ([(40, 56)], True, 96),
+        ([(96, 20)], True, 96),
+        ([(20, 30), (60, 50)], True, 0),
+    ],
+)
+def test_bidirectional_mm_cache_hit_preserves_atomic_spans(
+    positions, is_mm_prefix_lm, expected_hit
+):
+    """Re-query SWA groups when a cache hit would resume inside an image."""
+    config = make_kv_cache_config_hybrid_model(16, 64, sliding_window_blocks=1)
+    config.kv_cache_groups[0].kv_cache_spec = replace(
+        config.kv_cache_groups[0].kv_cache_spec, block_size=32
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=256,
+        hash_block_size=16,
+        is_mm_prefix_lm=is_mm_prefix_lm,
+    )
+    token_ids = list(range(128))
+    mm_positions = [PlaceholderRange(offset=o, length=n) for o, n in positions]
+    original = make_request("original", token_ids, 16, sha256, mm_positions)
+    blocks = manager.allocate_slots(original, len(token_ids))
+    assert blocks is not None
+    manager.free(original)
+
+    # Recomputing the last block for logits leaves a 96-token aligned hit.
+    replay = make_request("replay", token_ids, 16, sha256, mm_positions)
+    computed, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == expected_hit
+    assert [len(group) for group in computed.blocks] == [
+        expected_hit // 32,
+        expected_hit // 16,
+        expected_hit // 16,
+    ]
+    if expected_hit:
+        # Simply slicing a longer SWA hit would leave these as null blocks.
+        assert all(not group[-1].is_null for group in computed.blocks)
+
+
 def test_cache_key_salting():
     """
     This tests that cache salts are applied during hashing and the cache

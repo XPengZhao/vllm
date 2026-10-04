@@ -1010,6 +1010,20 @@ class VllmConfig:
         ):
             return
 
+        if self.model_config is not None:
+            hf_config = self.model_config.hf_config
+            if (
+                hf_config.model_type == "deepseek_v4"
+                and getattr(hf_config, "vision_n_layers", 0) > 0
+                and self.model_config.is_mm_prefix_lm
+            ):
+                raise ValueError(
+                    "DeepSeek-V4 vision does not support KV connectors yet: "
+                    "remote cache hits and load-failure recovery can split "
+                    "bidirectional image spans. Disable KV transfer/offloading; "
+                    "local prefix caching is supported."
+                )
+
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
         # remap a virtual address range to different physical pages over the
         # engine's lifetime. KV connectors that pin KV cache memory (e.g.

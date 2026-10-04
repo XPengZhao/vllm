@@ -132,6 +132,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        is_mm_prefix_lm: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -141,6 +142,7 @@ class KVCacheManager:
             max_in_flight_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        self.is_mm_prefix_lm = is_mm_prefix_lm
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -256,11 +258,27 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens, num_uncached = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+        while True:
+            computed_blocks, num_new_computed_tokens, num_uncached = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
             )
-        )
+            if not self.is_mm_prefix_lm:
+                break
+            for feature in request.mm_features:
+                position = feature.mm_position
+                if (
+                    position.offset
+                    < num_new_computed_tokens
+                    < position.offset + position.length
+                ):
+                    # Re-query every group: trimming an SWA hit may retain
+                    # null blocks where the earlier boundary needs live KV.
+                    max_cache_hit_length = position.offset
+                    break
+            else:
+                break
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
