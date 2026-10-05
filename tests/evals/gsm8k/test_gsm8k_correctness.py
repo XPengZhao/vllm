@@ -9,6 +9,8 @@ pytest -s -v tests/evals/gsm8k/test_gsm8k_correctness.py \
 """
 
 import shlex
+import sys
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -17,9 +19,56 @@ import yaml
 from tests.utils import RemoteOpenAIServer
 from vllm.platforms import current_platform
 
+from . import gsm8k_eval
 from .gsm8k_eval import evaluate_gsm8k
 
 DEFAULT_STARTUP_MAX_WAIT_SECONDS = 1200
+
+
+@pytest.mark.parametrize(
+    ("args", "use_chat", "model"),
+    [
+        ([], False, None),
+        (
+            ["--use-chat-completions", "--model", "qwen38-flash-next"],
+            True,
+            "qwen38-flash-next",
+        ),
+    ],
+)
+def test_gsm8k_cli_selects_completion_interface(monkeypatch, args, use_chat, model):
+    """The CLI preserves raw completion by default and opts into chat explicitly."""
+    evaluate = Mock(
+        return_value={
+            "accuracy": 1.0,
+            "invalid_rate": 0.0,
+            "latency": 1.0,
+            "questions_per_second": 1.0,
+            "total_output_tokens": 1,
+            "tokens_per_second": 1.0,
+        }
+    )
+    monkeypatch.setattr(gsm8k_eval, "evaluate_gsm8k", evaluate)
+    monkeypatch.setattr(sys, "argv", ["gsm8k_eval.py", "--num-questions", "32", *args])
+
+    gsm8k_eval.main()
+
+    assert evaluate.call_args.kwargs["use_chat_completions"] is use_chat
+    assert evaluate.call_args.kwargs["model"] == model
+    assert evaluate.call_args.kwargs["num_questions"] == 32
+
+
+def test_gsm8k_cli_rejects_chat_without_model(monkeypatch, capsys):
+    evaluate = Mock()
+    monkeypatch.setattr(gsm8k_eval, "evaluate_gsm8k", evaluate)
+    monkeypatch.setattr(sys, "argv", ["gsm8k_eval.py", "--use-chat-completions"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        gsm8k_eval.main()
+
+    assert exc_info.value.code == 2
+    assert "--model is required" in capsys.readouterr().err
+    evaluate.assert_not_called()
 
 
 def run_gsm8k_eval(eval_config: dict, server_url: str) -> dict:

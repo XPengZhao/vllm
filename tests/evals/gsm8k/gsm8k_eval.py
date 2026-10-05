@@ -352,6 +352,14 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="http://127.0.0.1", help="Host URL")
     parser.add_argument("--port", type=int, default=8000, help="Port number")
     parser.add_argument(
+        "--use-chat-completions",
+        action="store_true",
+        help="Use /v1/chat/completions with the server's chat template",
+    )
+    parser.add_argument(
+        "--model", help="Served model name (required with --use-chat-completions)"
+    )
+    parser.add_argument(
         "--temperature", type=float, default=0.0, help="Temperature for generation"
     )
     parser.add_argument(
@@ -371,11 +379,15 @@ def main() -> None:
     parser.add_argument("--save-results", type=str, help="Save results to JSON file")
 
     args = parser.parse_args()
+    if args.use_chat_completions and not args.model:
+        parser.error("--model is required with --use-chat-completions")
 
     result = evaluate_gsm8k(
         num_questions=args.num_questions,
         num_shots=args.num_shots,
         max_tokens=args.max_tokens,
+        model=args.model,
+        use_chat_completions=args.use_chat_completions,
         host=args.host,
         port=args.port,
         temperature=args.temperature,
