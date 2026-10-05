@@ -32,10 +32,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -363,7 +365,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -474,7 +476,7 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -491,6 +493,7 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        aux_hidden_states: list[torch.Tensor] = []
         if self.start_layer < self.end_layer:
             self._start_layer_ple_prefetch(
                 self.layers[self.start_layer],
@@ -520,6 +523,19 @@ class Qwen4ExpModel(nn.Module):
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
             )
+            if layer_idx + 1 in self.aux_hidden_state_layers:
+                # Cache generation pools the materialized HC streams in FP32.
+                # Reading this state must not consume the pending HC combine.
+                aux_multi_hidden = layer.mlp_hyper_connection.combine(
+                    hidden_states, block_output, injection
+                )
+                aux_hidden_states.append(
+                    aux_multi_hidden.unflatten(
+                        -1, (self.config.hc_count, self.config.hidden_size)
+                    )
+                    .mean(dim=-2, dtype=torch.float32)
+                    .to(aux_multi_hidden.dtype)
+                )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
             ):
@@ -566,6 +582,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -618,6 +636,7 @@ class Qwen4ExpForCausalLM(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsEagle3,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
 ):
@@ -684,7 +703,7 @@ class Qwen4ExpForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
         return self.model(
@@ -1007,7 +1026,7 @@ class Qwen4ExpForConditionalGeneration(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if intermediate_tensors is not None:
             inputs_embeds = None
         if inputs_embeds is not None and get_pp_group().is_first_rank:

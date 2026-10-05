@@ -1534,6 +1534,37 @@ class SpeculativeConfig:
                         hf_config.dspark_draft_topk = dspark_draft_topk
 
                     assert self.target_model_config is not None
+                    reranker_config = _get_qwen3_dspark_value(
+                        hf_config, "prefix_reranker"
+                    )
+                    if reranker_config is not None:
+                        if (
+                            "Qwen3DSparkModel"
+                            not in self.draft_model_config.architectures
+                        ):
+                            raise ValueError(
+                                "prefix_reranker requires Qwen3DSparkModel"
+                            )
+                        if not isinstance(reranker_config, Mapping):
+                            raise ValueError(
+                                "prefix_reranker must be a configuration dict"
+                            )
+                        if self.draft_sample_method != "greedy":
+                            raise ValueError(
+                                "DSpark prefix reranker supports greedy drafting only"
+                            )
+                        if self.enable_adaptive_verification:
+                            raise ValueError(
+                                "Disable adaptive verification for prefix reranking"
+                            )
+                        if dspark_draft_topk is not None:
+                            raise ValueError(
+                                "Do not combine dspark_draft_topk with prefix reranking"
+                            )
+                        if self.num_speculative_tokens > hf_config.block_size:
+                            raise ValueError(
+                                "num_speculative_tokens exceeds reranker block_size"
+                            )
                     _validate_qwen3_omni_dspark(
                         self.target_model_config,
                         self.draft_model_config,

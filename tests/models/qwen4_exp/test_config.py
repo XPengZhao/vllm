@@ -92,6 +92,53 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
     assert returned_multi_hidden is multi_hidden
 
 
+def test_qwen4_exp_aux_capture_pools_materialized_hc_without_changing_output():
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpModel
+
+    class Layer:
+        mlp_hyper_connection = SimpleNamespace(combine=lambda h, b, i: h + b)
+
+        def __call__(self, **kwargs):
+            h = kwargs["hidden_states"]
+            previous = kwargs["prev_block_output"]
+            if previous is not None:
+                h = h + previous
+            return h, torch.ones_like(h), None
+
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hc_count=2, hidden_size=4)
+    model.start_layer, model.end_layer = 0, 2
+    model.layers = [Layer(), Layer()]
+    model._start_layer_ple_prefetch = lambda *args: None
+    model._mtp_hidden_buffer = None
+    model.hyper_connection_mixer = SimpleNamespace(
+        combine_and_mix=lambda h, b, i: (
+            h + b,
+            (h + b).unflatten(-1, (2, 4)).mean(-2),
+            None,
+        )
+    )
+    multi = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    kwargs = dict(
+        input_ids=None,
+        positions=torch.arange(2),
+        intermediate_tensors={"hidden_states": multi},
+    )
+    pp = SimpleNamespace(is_first_rank=False, is_last_rank=True)
+    with patch("vllm.models.qwen4_exp.nvidia.model.get_pp_group", return_value=pp):
+        model.aux_hidden_state_layers = ()
+        baseline = model.forward(**kwargs)
+        model.aux_hidden_state_layers = (1, 2)
+        sampled, aux = model.forward(**kwargs)
+    torch.testing.assert_close(sampled, baseline)
+    assert len(aux) == 2
+    for i, state in enumerate(aux):
+        torch.testing.assert_close(
+            state, (multi + i + 1).unflatten(-1, (2, 4)).mean(-2)
+        )
+
+
 @spawn_new_process_for_each_test
 @pytest.mark.parametrize("backend", ["amd", "nvidia"])
 def test_qwen4_exp_mtp_remaps_mixed_precision_layer_indices(backend: str) -> None:

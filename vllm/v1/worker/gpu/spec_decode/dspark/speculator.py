@@ -87,6 +87,35 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        reranker = getattr(model.model, "prefix_reranker", None)
+        if reranker is not None:
+            if self.draft_logits is not None:
+                raise ValueError("DSpark prefix reranker supports greedy drafting only")
+            if self.enable_adaptive_verification:
+                raise ValueError(
+                    "Disable adaptive verification for the DSpark prefix reranker: "
+                    "the trained confidence head describes pre-rerank probabilities"
+                )
+            if self._draft_topk is not None:
+                raise ValueError(
+                    "Do not combine dspark_draft_topk with prefix reranking"
+                )
+            if not self.sample_from_anchor:
+                raise ValueError(
+                    "DSpark prefix reranker requires sample_from_anchor=True"
+                )
+            if model.draft_id_to_target_id is not None:
+                raise ValueError(
+                    "DSpark prefix reranker requires an unpruned draft vocab"
+                )
+            if self.num_speculative_steps > reranker.block_size:
+                raise ValueError("num_speculative_tokens exceeds reranker block_size")
+            logger.info(
+                "DSpark prefix reranker enabled: width=%d, heads=%d, top_k=%d",
+                reranker.width,
+                reranker.num_heads,
+                reranker.top_k,
+            )
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
@@ -154,6 +183,25 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        reranker = getattr(self.model.model, "prefix_reranker", None)
+        if reranker is not None:
+            n_spec = self.num_speculative_steps
+            sample_hidden = head_hidden[
+                self.sample_indices[: num_reqs * n_spec]
+            ].reshape(num_reqs, n_spec, -1)
+            base_logits = self.model.compute_draft_logits(
+                sample_hidden.flatten(0, 1)
+            ).reshape(num_reqs, n_spec, -1)
+            anchor_ids = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+            self.draft_tokens[:num_reqs] = reranker.sample(
+                base_logits,
+                sample_hidden,
+                anchor_ids,
+                self.model.markov_embed,
+                self.model.markov_bias,
+                self.model.model.markov_head.markov_w2.weight,
+            )
+            return
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
             return

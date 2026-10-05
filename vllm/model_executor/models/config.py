@@ -895,12 +895,13 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.method not in {
             "mtp",
+            "dspark",
             "ngram",
             "ngram_gpu",
         }:
             raise NotImplementedError(
-                "Qwen4Exp speculative decoding supports only its native MTP "
-                "checkpoint and linear n-gram proposers"
+                "Qwen4Exp speculative decoding supports DSpark, its native MTP "
+                "checkpoint, and linear n-gram proposers"
             )
 
 

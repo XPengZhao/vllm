@@ -200,6 +200,7 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
         "mask_token_id",
         "markov_rank",
         "markov_head_type",
+        "prefix_reranker",
         "block_size",
         "enable_confidence_head",
         "confidence_head_with_markov",

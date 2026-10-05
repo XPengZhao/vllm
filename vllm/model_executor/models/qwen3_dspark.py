@@ -34,6 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.platforms import current_platform
 
+from .dspark_prefix_reranker import DSparkPrefixReranker
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import (
     AutoWeightsLoader,
@@ -203,6 +204,18 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             vllm_config=vllm_config, start_layer_id=start_layer_id, prefix=prefix
         )
         config = self.config
+        # SpecForge exports head settings inside dflash_config. Preserve the
+        # same nested-over-top-level precedence as the draft backbone.
+        dspark_config = getattr(config, "dflash_config", None) or {}
+        for key in (
+            "markov_rank",
+            "markov_head_type",
+            "enable_confidence_head",
+            "confidence_head_with_markov",
+            "prefix_reranker",
+        ):
+            if key in dspark_config:
+                setattr(config, key, dspark_config[key])
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )
@@ -217,6 +230,25 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             ),
         )
         self.confidence_head: DSparkConfidenceHead | None = None
+        self.prefix_reranker: DSparkPrefixReranker | None = None
+        reranker_config = getattr(config, "prefix_reranker", None)
+        if reranker_config is not None:
+            if self.quant_config is not None:
+                raise ValueError("DSpark prefix reranker requires an unquantized draft")
+            if draft_vocab_size != config.vocab_size:
+                raise ValueError(
+                    "DSpark prefix reranker requires an unpruned draft vocab"
+                )
+            if getattr(config, "markov_head_type", "vanilla") != "vanilla":
+                raise ValueError(
+                    "DSpark prefix reranker requires a vanilla Markov head"
+                )
+            self.prefix_reranker = DSparkPrefixReranker(
+                config.hidden_size,
+                config.markov_rank,
+                config.block_size,
+                **reranker_config,
+            )
         if getattr(config, "enable_confidence_head", False):
             with_markov = getattr(config, "confidence_head_with_markov", False)
             input_dim = config.hidden_size
@@ -357,6 +389,15 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             )
 
         orig_to_new_substr = {"mask_embedding": None}
+        reranker = self.model.prefix_reranker
+        if reranker is not None:
+            expected = {"model.prefix_reranker." + k for k in reranker.state_dict()}
+            missing = expected - model_weights.keys()
+            if missing:
+                raise ValueError(
+                    "Incomplete DSpark prefix reranker checkpoint; missing weights: "
+                    + ", ".join(sorted(missing))
+                )
         if not includes_embed_tokens:
             orig_to_new_substr["embed_tokens"] = None
         if not includes_lm_head:

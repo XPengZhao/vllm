@@ -8,9 +8,11 @@ import pytest
 import torch
 
 from vllm.config import ParallelConfig
+from vllm.model_executor.models.dspark_prefix_reranker import DSparkPrefixReranker
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.gpu import model_runner
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import _get_dspark_parallel_config
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
@@ -58,6 +60,43 @@ def test_dspark_parallel_config_disables_eplb_atomically():
     assert draft_config.eplb_config.num_redundant_experts == 0
     assert not draft_config.enable_elastic_ep
     assert draft_config.eplb_config is not target_config.eplb_config
+
+
+def test_prefix_reranker_walk_reads_selected_hidden_rows_and_request_anchors():
+    torch.manual_seed(11)
+    reranker = DSparkPrefixReranker(6, 4, 3, width=8, num_heads=2, top_k=3)
+    with torch.no_grad():
+        reranker.residual_out.weight.normal_()
+    w1, w2 = torch.randn(9, 4), torch.randn(9, 4)
+    lm_head = torch.randn(9, 6)
+    embed = lambda ids: torch.nn.functional.embedding(ids, w1)
+    bias = lambda e: torch.nn.functional.linear(e, w2)
+    logits = lambda h: torch.nn.functional.linear(h, lm_head)
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.model = SimpleNamespace(
+        model=SimpleNamespace(
+            prefix_reranker=reranker,
+            markov_head=SimpleNamespace(markov_w2=SimpleNamespace(weight=w2)),
+        ),
+        compute_draft_logits=logits,
+        markov_embed=embed,
+        markov_bias=bias,
+    )
+    speculator.num_speculative_steps = 3
+    speculator.sample_indices = torch.tensor([3, 1, 5, 2, 6, 0])
+    speculator._anchor_idx = torch.tensor([0, 3])
+    speculator.input_buffers = SimpleNamespace(
+        input_ids=torch.tensor([2, 0, 0, 7, 0, 0])
+    )
+    speculator.draft_tokens = torch.full((3, 3), -1, dtype=torch.long)
+    head_hidden = torch.randn(7, 6)
+    selected = head_hidden[speculator.sample_indices].view(2, 3, 6)
+    expected = reranker.sample(
+        logits(selected), selected, torch.tensor([2, 7]), embed, bias, w2
+    )
+    speculator._sample_sequential(2, head_hidden)
+    torch.testing.assert_close(speculator.draft_tokens[:2], expected)
+    assert (speculator.draft_tokens[2] == -1).all()
 
 
 @pytest.mark.parametrize("pcp_size", [1, 4])

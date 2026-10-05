@@ -133,6 +133,29 @@ def test_mtp_stages_are_independent_of_dspark_width():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"draft_sample_method": "probabilistic"}, "greedy drafting only"),
+        ({"dspark_draft_topk": 4}, "Do not combine"),
+        ({"enable_adaptive_verification": True}, "Disable adaptive verification"),
+        ({"num_speculative_tokens": 5}, "exceeds reranker block_size"),
+    ],
+)
+def test_prefix_reranker_rejects_incompatible_sampling_modes(overrides, message):
+    hf_kwargs = dict(
+        model_type="qwen3",
+        architectures=["Qwen3DSparkModel"],
+        vocab_size=32,
+        block_size=4,
+        dflash_config={"prefix_reranker": {"width": 8, "num_heads": 2, "top_k": 3}},
+    )
+    settings = {"method": "dspark", "num_speculative_tokens": 4, **overrides}
+    with pytest.raises(ValueError, match=message):
+        _make_speculative_config(hf_kwargs, "Qwen3DSparkModel", **settings)
+
+
+@pytest.mark.cpu_test
 def test_callable_overrides_reach_the_draft_config():
     """A callable override (config-to-config transform) composes with the
     architecture-mapping override and is applied to the draft config."""

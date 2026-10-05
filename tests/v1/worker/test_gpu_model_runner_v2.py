@@ -22,6 +22,48 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
 
 
+@pytest.mark.parametrize("method", [None, "dspark", "dflash", "eagle3"])
+def test_non_mtp_drafting_does_not_read_mtp_hidden_buffer(method):
+    """DSpark must retain its normal hidden inputs even on an MTP-capable target."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = (
+        SimpleNamespace(method=method) if method is not None else None
+    )
+    runner.model = SimpleNamespace(get_mtp_target_hidden_states=Mock(return_value=None))
+    hidden_states = torch.randn(3, 4)
+
+    assert runner._get_spec_hidden_states(hidden_states) is hidden_states
+    runner.model.get_mtp_target_hidden_states.assert_not_called()
+
+
+def test_mtp_drafting_slices_target_hidden_buffer_to_active_tokens():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    mtp_hidden_states = torch.randn(8, 12)
+    runner.model = SimpleNamespace(
+        get_mtp_target_hidden_states=Mock(return_value=mtp_hidden_states)
+    )
+    hidden_states = torch.randn(3, 4)
+
+    actual = runner._get_spec_hidden_states(hidden_states)
+
+    torch.testing.assert_close(actual, mtp_hidden_states[:3])
+    assert actual.data_ptr() == mtp_hidden_states.data_ptr()
+    runner.model.get_mtp_target_hidden_states.assert_called_once_with()
+
+
+@pytest.mark.parametrize("has_hook", [False, True])
+def test_mtp_drafting_without_target_buffer_keeps_normal_hidden_states(has_hook):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    runner.model = SimpleNamespace()
+    if has_hook:
+        runner.model.get_mtp_target_hidden_states = Mock(return_value=None)
+    hidden_states = torch.randn(3, 4)
+
+    assert runner._get_spec_hidden_states(hidden_states) is hidden_states
+
+
 def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.is_last_pp_rank = False

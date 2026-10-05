@@ -56,3 +56,10 @@ def test_dspark_updater_maps_bonus_anchor_semantics() -> None:
 
     assert config["sample_from_anchor"] is False
     assert config["dspark_bonus_anchor"] is True
+
+
+def test_dspark_updater_preserves_prefix_reranker_settings() -> None:
+    outer_config = _make_dspark_config("Qwen3DSparkModel")
+    outer_config["prefix_reranker"] = {"width": 256, "num_heads": 4, "top_k": 16}
+    config = SpeculatorsConfig.extract_transformers_pre_trained_config(outer_config)
+    assert config["prefix_reranker"] == outer_config["prefix_reranker"]
