@@ -305,6 +305,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        bind_request_state = getattr(self.speculator, "bind_request_state", None)
+        if bind_request_state is not None:
+            bind_request_state(self.req_states)
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,

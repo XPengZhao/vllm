@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.config import ParallelConfig
+from vllm.model_executor.models.dspark_ngram_markov import DSparkNgramMarkovAdapter
 from vllm.model_executor.models.dspark_prefix_reranker import DSparkPrefixReranker
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.gpu import model_runner
@@ -97,6 +98,71 @@ def test_prefix_reranker_walk_reads_selected_hidden_rows_and_request_anchors():
     speculator._sample_sequential(2, head_hidden)
     torch.testing.assert_close(speculator.draft_tokens[:2], expected)
     assert (speculator.draft_tokens[2] == -1).all()
+
+
+def test_ngram_markov_walk_uses_generated_prefix_and_resets_each_round():
+    torch.manual_seed(3)
+    adapter = DSparkNgramMarkovAdapter(6, 4, 1e-6)
+    with torch.no_grad():
+        adapter.ngram_value_proj.weight.normal_()
+    w1, w2, lm = torch.randn(11, 4), torch.randn(11, 4), torch.randn(11, 6)
+    embed = lambda ids: torch.nn.functional.embedding(ids, w1)
+    bias = lambda m: torch.nn.functional.linear(m, w2)
+    logits = lambda h: torch.nn.functional.linear(h, lm)
+    calls = []
+
+    class Lookup:
+        context_length = 2
+        eos_token_id = 10
+
+        def __call__(self, previous, context, dtype):
+            calls.append((previous.clone(), context.clone()))
+            return torch.cat([context, previous[:, None]], -1).float().repeat(1, 2)
+
+    spec = DSparkSpeculator.__new__(DSparkSpeculator)
+    spec.model = SimpleNamespace(
+        model=SimpleNamespace(prefix_reranker=None),
+        compute_draft_logits=logits,
+        markov_embed=embed,
+        ngram_markov_embed=lambda ids, h, n: adapter(embed(ids), h, n),
+        markov_bias=bias,
+    )
+    spec.ngram_lookup = Lookup()
+    spec.num_speculative_steps = 3
+    spec.sample_indices = torch.tensor([3, 1, 5, 2, 6, 0])
+    spec.sample_idx_mapping = torch.tensor([1, 1, 1, 0, 0, 0])
+    spec.sample_pos = torch.zeros(6, dtype=torch.long)
+    spec._anchor_idx = torch.tensor([0, 3])
+    spec.input_buffers = SimpleNamespace(
+        input_ids=torch.tensor([2, 0, 0, 7, 0, 0]),
+        positions=torch.tensor([3, 4, 5, 1, 2, 3]),
+    )
+    spec.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=torch.tensor([[1, 8, 9, 9], [3, 4, 5, 9]]))
+    )
+    spec.draft_tokens = torch.full((3, 3), -1, dtype=torch.long)
+    spec._draft_topk = None
+    spec.use_confidence_head = False
+    spec._sample_logits = lambda scores, *args: scores.argmax(-1)
+    head_hidden = torch.randn(7, 6)
+    spec._sample_sequential(2, head_hidden)
+    selected = head_hidden[spec.sample_indices].view(2, 3, 6)
+    previous, context = torch.tensor([2, 7]), torch.tensor([[4, 5], [10, 1]])
+    expected = []
+    for i in range(3):
+        torch.testing.assert_close(calls[i][0], previous)
+        torch.testing.assert_close(calls[i][1], context)
+        raw = torch.cat([context, previous[:, None]], -1).float().repeat(1, 2)
+        m = adapter(embed(previous), selected[:, i], raw)
+        context = torch.cat([context[:, 1:], previous[:, None]], -1)
+        previous = (logits(selected[:, i]) + bias(m)).argmax(-1)
+        expected.append(previous)
+    torch.testing.assert_close(spec.draft_tokens[:2], torch.stack(expected, -1))
+    assert (spec.draft_tokens[2] == -1).all()
+    first_context = calls[0][1].clone()
+    calls.clear()
+    spec._sample_sequential(2, head_hidden)
+    torch.testing.assert_close(calls[0][1], first_context)
 
 
 @pytest.mark.parametrize("pcp_size", [1, 4])

@@ -32,7 +32,12 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.ngram import (
+    DSparkNgramLookup,
+    gather_ngram_context,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
 
@@ -80,6 +85,11 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        self.ngram_lookup: DSparkNgramLookup | None = None
+        self.req_states: RequestState | None = None
+
+    def bind_request_state(self, req_states: RequestState) -> None:
+        self.req_states = req_states
 
     def load_draft_model(
         self,
@@ -87,6 +97,16 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        if getattr(model.model, "ngram_markov_enabled", False):
+            if not self.sample_from_anchor:
+                raise ValueError("DSpark Engram requires sample_from_anchor=True")
+            self.ngram_lookup = DSparkNgramLookup(
+                target_model, self.draft_model_config.get_hidden_size()
+            )
+            logger.info(
+                "DSpark Engram Markov enabled: context=%d, eager synchronous lookup",
+                self.ngram_lookup.context_length,
+            )
         reranker = getattr(model.model, "prefix_reranker", None)
         if reranker is not None:
             if self.draft_logits is not None:
@@ -206,6 +226,22 @@ class DSparkSpeculator(DFlashSpeculator):
             self._sample_sequential_topk(num_reqs, head_hidden)
             return
 
+        ngram_lookup = getattr(self, "ngram_lookup", None)
+        ngram_context = None
+        if ngram_lookup is not None:
+            assert self.req_states is not None
+            request_indices = self.sample_idx_mapping[
+                : num_reqs * self.num_speculative_steps
+            ].view(num_reqs, self.num_speculative_steps)[:, 0]
+            anchor_positions = self.input_buffers.positions[self._anchor_idx[:num_reqs]]
+            ngram_context = gather_ngram_context(
+                self.req_states.all_token_ids.gpu,
+                request_indices,
+                anchor_positions,
+                ngram_lookup.context_length,
+                ngram_lookup.eos_token_id,
+            )
+
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
@@ -226,7 +262,17 @@ class DSparkSpeculator(DFlashSpeculator):
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
-            markov_embed = self.model.markov_embed(prev)
+            if ngram_lookup is None:
+                markov_embed = self.model.markov_embed(prev)
+            else:
+                assert ngram_context is not None
+                ngram = ngram_lookup(prev, ngram_context, sample_hidden.dtype)
+                markov_embed = self.model.ngram_markov_embed(
+                    prev, sample_hidden.view(num_reqs, n_spec, -1)[:, i], ngram
+                )
+                ngram_context = torch.cat(
+                    [ngram_context[:, 1:], prev.unsqueeze(1)], dim=1
+                )
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)

@@ -51,6 +51,10 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.gpu.spec_decode.dspark.ngram import (
+    DSparkNgramLookup,
+    gather_ngram_context,
+)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -1026,6 +1030,52 @@ def _ngram_hash_params(device: torch.device, context_len: int) -> dict:
         "eos_token_id": _NGRAM_EOS_TOKEN_ID,
         "heads_per_ngram": _NGRAM_HEADS_PER_NGRAM,
     }
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("context_len", [1, 2, 3])
+def test_dspark_sequential_lookup_matches_full_prefix(context_len: int) -> None:
+    """Hash selected draft tokens exactly as a complete target prefix does."""
+    params = _ngram_hash_params(torch.device("cpu"), context_len)
+    embedding = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(embedding)
+    for name, value in params.items():
+        setattr(embedding, name, value)
+    embedding.ngram_size = context_len + 1
+    embedding.embedding_dim = context_len * _NGRAM_HEADS_PER_NGRAM * 3
+    table = nn.Embedding(int(params["ngram_heads_vocab_sizes"].sum()), 3)
+    table.supports_prefetch = False
+    table.dequantize = lambda values, dtype: values.to(dtype)
+    embedding.ngram_embedding = table
+    target = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[None, SimpleNamespace(ple=SimpleNamespace(ple_embedding=embedding))]
+        )
+    )
+    lookup = DSparkNgramLookup(target, embedding.embedding_dim)
+    eos = _NGRAM_EOS_TOKEN_ID
+    # Request order differs from storage; one prefix crosses an EOS boundary.
+    prefixes = [[31], [11, eos, 13]]
+    all_ids = torch.tensor([[11, eos, 13, 90, 91], [31, 90, 91, 92, 93]])
+    context = gather_ngram_context(
+        all_ids, torch.tensor([1, 0]), torch.tensor([0, 2]), context_len, eos
+    )
+    previous = torch.tensor([31, 13])
+    for selected in ([41, 21], [eos, 22], [43, eos], [44, 24]):
+        result = lookup(previous, context, torch.bfloat16)
+        starts = torch.tensor([0, *accumulate(map(len, prefixes))], dtype=torch.int32)
+        full_ids = _reference_ngram_ids(
+            torch.tensor([token for prefix in prefixes for token in prefix]),
+            starts,
+            torch.full((2, context_len), eos),
+            **params,
+        )
+        expected = table(full_ids[starts[1:].long() - 1]).flatten(-2).bfloat16()
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        context = torch.cat([context[:, 1:], previous[:, None]], dim=1)
+        previous = torch.tensor(selected)
+        for prefix, token in zip(prefixes, selected):
+            prefix.append(token)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused PLE needs CUDA")

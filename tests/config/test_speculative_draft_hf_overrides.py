@@ -12,13 +12,14 @@ when the target itself is shrunk — which is what kept spec-decode archs like
 """
 
 import functools
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from transformers import PreTrainedConfig
 
 from vllm.config.parallel import ParallelConfig
-from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative import SpeculativeConfig, _validate_dspark_ngram_config
 
 
 def _make_hf_config(**kwargs) -> PreTrainedConfig:
@@ -45,6 +46,88 @@ def test_dict_overrides_are_not_forwarded_to_draft():
 def test_none_overrides_fall_back_to_arch_mapping():
     composed = SpeculativeConfig.compose_draft_hf_overrides(None)
     assert composed is SpeculativeConfig.hf_config_override
+
+
+def _ngram_config():
+    return SimpleNamespace(
+        method="dspark",
+        draft_model_config=SimpleNamespace(
+            architectures=["Qwen3DSparkModel"],
+            hf_config=SimpleNamespace(
+                dflash_config={"markov_head_type": "ngram_attention"}
+            ),
+        ),
+        target_model_config=SimpleNamespace(
+            enforce_eager=True, hf_text_config=SimpleNamespace(ple_layer_ids=[2])
+        ),
+        target_parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            tensor_parallel_size=4,
+        ),
+        draft_tensor_parallel_size=4,
+        draft_sample_method="greedy",
+        enable_adaptive_verification=False,
+        dspark_draft_topk=None,
+    )
+
+
+def test_ngram_markov_accepts_eager_target_table_reuse():
+    _validate_dspark_ngram_config(_ngram_config())
+
+
+def test_ngram_validation_does_not_change_vanilla_dspark():
+    config = _ngram_config()
+    config.draft_model_config.hf_config.dflash_config = {"markov_head_type": "vanilla"}
+    config.target_model_config.enforce_eager = False
+    config.draft_tensor_parallel_size = 1
+    _validate_dspark_ngram_config(config)
+    _validate_dspark_ngram_config(SimpleNamespace(method="mtp"))
+
+
+@pytest.mark.parametrize(
+    "setting, value, message",
+    [
+        ("prefix_reranker", {"top_k": 16}, "prefix reranking"),
+        ("sample_from_anchor", False, "sample_from_anchor"),
+    ],
+)
+def test_ngram_markov_rejects_incompatible_draft_structure(setting, value, message):
+    config = _ngram_config()
+    setattr(config.draft_model_config.hf_config, setting, value)
+    with pytest.raises(ValueError, match=message):
+        _validate_dspark_ngram_config(config)
+
+
+@pytest.mark.parametrize(
+    "section, name, value, message",
+    [
+        (None, "draft_sample_method", "probabilistic", "greedy drafting"),
+        (None, "enable_adaptive_verification", True, "Disable adaptive"),
+        (None, "dspark_draft_topk", 16, "Do not combine"),
+        (None, "draft_tensor_parallel_size", 1, "draft TP=target TP"),
+        ("target_model_config", "enforce_eager", False, "enforce-eager"),
+        ("target_parallel_config", "pipeline_parallel_size", 2, "PP=DP"),
+        ("target_parallel_config", "data_parallel_size", 2, "PP=DP"),
+        ("target_parallel_config", "prefill_context_parallel_size", 2, "PP=DP"),
+        ("target_parallel_config", "decode_context_parallel_size", 2, "PP=DP"),
+    ],
+)
+def test_ngram_markov_rejects_unsupported_execution(section, name, value, message):
+    config = _ngram_config()
+    setattr(getattr(config, section) if section else config, name, value)
+    with pytest.raises(ValueError, match=message):
+        _validate_dspark_ngram_config(config)
+
+
+@pytest.mark.parametrize("ple_layers", [[], [1], [2, 4]])
+def test_ngram_markov_requires_the_cache_source_ple_layer(ple_layers):
+    config = _ngram_config()
+    config.target_model_config.hf_text_config.ple_layer_ids = ple_layers
+    with pytest.raises(ValueError, match="ple_layer_ids"):
+        _validate_dspark_ngram_config(config)
 
 
 def _make_speculative_config(

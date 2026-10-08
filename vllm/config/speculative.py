@@ -145,6 +145,49 @@ def _get_qwen3_dspark_value(config: Any, name: str) -> Any:
     return value
 
 
+def _validate_dspark_ngram_config(speculative: Any) -> None:
+    if speculative.method != "dspark":
+        return
+    draft = speculative.draft_model_config
+    hf_config = draft.hf_config
+    if _get_qwen3_dspark_value(hf_config, "markov_head_type") not in (
+        "ngram",
+        "ngram_attention",
+    ):
+        return
+    target = speculative.target_model_config
+    parallel = speculative.target_parallel_config
+    if "Qwen3DSparkModel" not in draft.architectures:
+        raise ValueError("DSpark Engram requires Qwen3DSparkModel")
+    if speculative.draft_sample_method != "greedy":
+        raise ValueError("DSpark Engram supports greedy drafting only")
+    if speculative.enable_adaptive_verification:
+        raise ValueError("Disable adaptive verification for Engram")
+    topk = speculative.dspark_draft_topk
+    if topk is None:
+        topk = getattr(hf_config, "dspark_draft_topk", None)
+    if topk is not None:
+        raise ValueError("Do not combine dspark_draft_topk with Engram")
+    if _get_qwen3_dspark_value(hf_config, "prefix_reranker") is not None:
+        raise ValueError("Do not combine prefix reranking with Engram")
+    if not getattr(hf_config, "sample_from_anchor", True):
+        raise ValueError("DSpark Engram requires sample_from_anchor=True")
+    if not target.enforce_eager:
+        raise ValueError("DSpark Engram currently requires --enforce-eager")
+    if list(getattr(target.hf_text_config, "ple_layer_ids", [])) != [2]:
+        raise ValueError("DSpark Engram requires target ple_layer_ids=[2]")
+    if (
+        parallel.pipeline_parallel_size != 1
+        or parallel.data_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        or speculative.draft_tensor_parallel_size != parallel.tensor_parallel_size
+    ):
+        raise ValueError(
+            "DSpark Engram requires PP=DP=PCP=DCP=1 and draft TP=target TP"
+        )
+
+
 def _validate_qwen3_omni_dspark(
     target_model_config: ModelConfig,
     draft_model_config: ModelConfig,
@@ -1578,6 +1621,7 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config,
                     )
                 )
+                _validate_dspark_ngram_config(self)
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,

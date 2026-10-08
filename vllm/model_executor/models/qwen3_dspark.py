@@ -34,6 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.platforms import current_platform
 
+from .dspark_ngram_markov import DSparkNgramMarkovAdapter
 from .dspark_prefix_reranker import DSparkPrefixReranker
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import (
@@ -229,6 +230,18 @@ class Qwen3DSparkModel(DFlashQwen3Model):
                 getattr(config, "dspark_draft_topk", None) is not None
             ),
         )
+        head_type = getattr(config, "markov_head_type", "vanilla")
+        self.ngram_markov_enabled = head_type in ("ngram", "ngram_attention")
+        if self.ngram_markov_enabled:
+            if self.quant_config is not None:
+                raise ValueError("DSpark Engram requires an unquantized draft")
+            if draft_vocab_size != config.vocab_size:
+                raise ValueError("DSpark Engram requires an unpruned draft vocab")
+            self.markov_head.ngram_adapter = DSparkNgramMarkovAdapter(
+                config.hidden_size, config.markov_rank, config.rms_norm_eps
+            )
+        elif head_type != "vanilla":
+            raise ValueError(f"Unsupported DSpark markov_head_type: {head_type}")
         self.confidence_head: DSparkConfidenceHead | None = None
         self.prefix_reranker: DSparkPrefixReranker | None = None
         reranker_config = getattr(config, "prefix_reranker", None)
@@ -319,6 +332,13 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def ngram_markov_embed(
+        self, token_ids: torch.Tensor, hidden: torch.Tensor, ngram: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.markov_head.ngram_adapter(
+            self.markov_embed(token_ids), hidden, ngram
+        )
+
     def apply_markov_bias_gathered(
         self,
         markov_embed: torch.Tensor,
@@ -388,7 +408,25 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
                 "d2t mapping so sampled draft ids can be converted to target ids."
             )
 
-        orig_to_new_substr = {"mask_embedding": None}
+        orig_to_new_substr: dict[str, str | None] = {"mask_embedding": None}
+        if self.model.ngram_markov_enabled:
+            adapter = self.model.markov_head.ngram_adapter
+            expected = {"model.markov_head." + k for k in adapter.state_dict()}
+            expected.update(
+                {
+                    "model.markov_head.markov_w1.weight",
+                    "model.markov_head.markov_w2.weight",
+                }
+            )
+            missing = expected - model_weights.keys()
+            if missing:
+                raise ValueError(
+                    "Incomplete DSpark Engram checkpoint; missing weights: "
+                    + ", ".join(sorted(missing))
+                )
+            orig_to_new_substr["markov_head.ngram_"] = (
+                "markov_head.ngram_adapter.ngram_"
+            )
         reranker = self.model.prefix_reranker
         if reranker is not None:
             expected = {"model.prefix_reranker." + k for k in reranker.state_dict()}
