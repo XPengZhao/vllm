@@ -239,3 +239,44 @@ def test_nvfp4_gathered_markov_bias_kernel_matches_reference(batch_size: int):
         torch.testing.assert_close(
             logits.gather(1, index), expected, rtol=1e-2, atol=6.25e-2
         )
+
+
+@pytest.mark.parametrize("confidence_with_markov", [False, True])
+def test_dspark_nested_markov_config_overrides_top_level(confidence_with_markov):
+    """SpecForge's nested head config must determine Markov and confidence shapes."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkModel
+
+    config = SimpleNamespace(
+        vocab_size=32,
+        hidden_size=16,
+        markov_rank=8,
+        enable_confidence_head=False,
+        dflash_config={
+            "markov_rank": 4,
+            "markov_head_type": "vanilla",
+            "enable_confidence_head": True,
+            "confidence_head_with_markov": confidence_with_markov,
+        },
+    )
+
+    def init_backbone(self, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.config = config
+        self.quant_config = None
+
+    with (
+        patch(
+            "vllm.model_executor.models.qwen3_dspark.DFlashQwen3Model.__init__",
+            init_backbone,
+        ),
+        patch("vllm.model_executor.models.qwen3_dspark.DSparkMarkovHead") as markov,
+        patch("vllm.model_executor.models.qwen3_dspark.DSparkConfidenceHead") as conf,
+    ):
+        Qwen3DSparkModel(vllm_config=SimpleNamespace())
+
+    assert markov.call_args.args == (32, 32, 4)
+    assert conf.call_args.args == (20 if confidence_with_markov else 16,)
+    assert conf.call_args.kwargs["with_markov"] == confidence_with_markov

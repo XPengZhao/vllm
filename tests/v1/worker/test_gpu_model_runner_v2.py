@@ -344,6 +344,7 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
 def test_get_drafter_hidden_states_tolerates_missing_target_buffer(target_buffer):
     """Targets allocate the MTP hidden buffer only for hidden-state drafters."""
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(method="mtp")
     hidden_states = torch.zeros(4, 8)
     buffer = torch.arange(16 * 8, dtype=torch.float32).view(16, 8)
     if target_buffer == "absent":
@@ -358,6 +359,20 @@ def test_get_drafter_hidden_states_tolerates_missing_target_buffer(target_buffer
         assert torch.equal(out, buffer[:4])
     else:
         assert out is hidden_states
+
+
+@pytest.mark.parametrize("method", [None, "dspark", "dflash", "eagle3"])
+def test_non_mtp_drafting_does_not_read_mtp_hidden_buffer(method):
+    """DSpark must keep its pooled target features on an HC target."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = (
+        SimpleNamespace(method=method) if method is not None else None
+    )
+    runner.model = SimpleNamespace(get_mtp_target_hidden_states=Mock())
+    hidden_states = torch.randn(3, 4)
+
+    assert runner._get_drafter_hidden_states(hidden_states) is hidden_states
+    runner.model.get_mtp_target_hidden_states.assert_not_called()
 
 
 def test_async_copy_to_np_does_not_alias_reused_buffer():

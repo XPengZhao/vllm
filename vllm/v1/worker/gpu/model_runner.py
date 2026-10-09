@@ -2075,13 +2075,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return None
 
     def _get_drafter_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Hidden states fed to the drafter.
-
-        Targets such as DeepSeek V4 expose the pre-hc_head residual through
-        get_mtp_target_hidden_states(). The buffer is sized at
-        max_num_batched_tokens and only allocated for drafters that consume
-        target hidden states, so None means "use the regular hidden states".
-        """
+        """Use pre-HC hidden states only for native MTP drafting."""
+        if self.speculative_config is None or self.speculative_config.method != "mtp":
+            return hidden_states
         get_target_hidden_states = getattr(
             self.model, "get_mtp_target_hidden_states", None
         )

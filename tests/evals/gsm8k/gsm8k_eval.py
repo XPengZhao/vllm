@@ -90,6 +90,8 @@ async def call_vllm_api(
     seed: int | None = None,
     top_p: float | None = None,
     top_k: int | None = None,
+    min_p: float | None = None,
+    record: dict | None = None,
 ) -> tuple[str, int]:
     """Call vLLM's OpenAI-compatible completions endpoint.
 
@@ -103,17 +105,30 @@ async def call_vllm_api(
         "stop": stop,
     }
     data.update(
-        _optional_params(temperature=temperature, seed=seed, top_p=top_p, top_k=top_k)
+        _optional_params(
+            temperature=temperature, seed=seed, top_p=top_p, top_k=top_k, min_p=min_p
+        )
     )
+
+    if record is not None:
+        record["request"] = data
 
     try:
         async with session.post(f"{url}/v1/completions", json=data) as response:
+            if record is not None:
+                record["http_status"] = response.status
+                if response.status >= 400:
+                    record["http_error_body"] = await response.text()
             response.raise_for_status()
             result = await response.json()
+            if record is not None:
+                record["response"] = result
             text = result["choices"][0]["text"]
             completion_tokens = result.get("usage", {}).get("completion_tokens", 0)
             return text, completion_tokens
     except Exception as e:
+        if record is not None:
+            record["error"] = f"{type(e).__name__}: {e}"
         print(f"Error calling vLLM API ({type(e).__name__}): {e}")
         return "", 0
 
@@ -131,6 +146,8 @@ async def call_vllm_chat_api(
     top_k: int | None = None,
     reasoning_effort: str | None = None,
     chat_template_kwargs: dict[str, object] | None = None,
+    min_p: float | None = None,
+    record: dict | None = None,
 ) -> tuple[str, int]:
     """Call vLLM's OpenAI-compatible chat completions endpoint.
 
@@ -155,19 +172,31 @@ async def call_vllm_chat_api(
             seed=seed,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             reasoning_effort=reasoning_effort,
             chat_template_kwargs=chat_template_kwargs,
         )
     )
 
+    if record is not None:
+        record["request"] = data
+
     try:
         async with session.post(f"{url}/v1/chat/completions", json=data) as response:
+            if record is not None:
+                record["http_status"] = response.status
+                if response.status >= 400:
+                    record["http_error_body"] = await response.text()
             response.raise_for_status()
             result = await response.json()
+            if record is not None:
+                record["response"] = result
             text = result["choices"][0]["message"]["content"] or ""
             completion_tokens = result.get("usage", {}).get("completion_tokens", 0)
             return text, completion_tokens
     except Exception as e:
+        if record is not None:
+            record["error"] = f"{type(e).__name__}: {e}"
         print(f"Error calling vLLM chat API ({type(e).__name__}): {e}")
         return "", 0
 
@@ -250,10 +279,12 @@ def evaluate_gsm8k(
     top_k: int | None = None,
     reasoning_effort: str | None = None,
     chat_template_kwargs: dict[str, object] | None = None,
-) -> dict[str, float | int]:
+    min_p: float | None = None,
+    save_details: str | None = None,
+) -> dict[str, object]:
     """Evaluate GSM8K accuracy using vLLM serve endpoint.
 
-    ``temperature``, ``top_p`` and ``top_k`` are sent only when not ``None``;
+    ``temperature``, ``top_p``, ``top_k`` and ``min_p`` are sent only when not ``None``;
     otherwise the server default applies. ``model`` is used only in chat mode,
     where it may be ``None`` (the server uses its served model).
     ``reasoning_effort`` and ``chat_template_kwargs`` require
@@ -269,9 +300,12 @@ def evaluate_gsm8k(
             "reasoning_effort and chat_template_kwargs require "
             "use_chat_completions=True"
         )
+    if save_details is not None and os.path.exists(save_details):
+        raise FileExistsError(save_details)
     base_url = f"{host}:{port}"
     prompts, labels = _build_gsm8k_prompts(num_questions, num_shots, gen_prefix)
     num_questions = len(prompts)
+    records: list[dict] | None = [{} for _ in prompts] if save_details else None
 
     async def run_async_evaluation():
         states: list[str] = [""] * num_questions
@@ -291,6 +325,8 @@ def evaluate_gsm8k(
                     seed=seed,
                     top_p=top_p,
                     top_k=top_k,
+                    min_p=min_p,
+                    record=records[i] if records is not None else None,
                     reasoning_effort=reasoning_effort,
                     chat_template_kwargs=chat_template_kwargs,
                 )
@@ -305,6 +341,8 @@ def evaluate_gsm8k(
                     seed=seed,
                     top_p=top_p,
                     top_k=top_k,
+                    min_p=min_p,
+                    record=records[i] if records is not None else None,
                 )
             states[i] = answer
             output_tokens[i] = tokens
@@ -330,7 +368,63 @@ def evaluate_gsm8k(
     states, output_tokens = asyncio.run(run_async_evaluation())
     latency = time.perf_counter() - tic
 
-    return _score_gsm8k(states, output_tokens, labels, num_shots, max_tokens, latency)
+    result: dict[str, object] = dict(
+        _score_gsm8k(states, output_tokens, labels, num_shots, max_tokens, latency)
+    )
+    result["sampling_params"] = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "seed": seed,
+    }
+    if records is not None:
+        details = []
+        for i, record in enumerate(records):
+            response = record.get("response", {})
+            choice = (response.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            reasoning = message.get("reasoning") or message.get("reasoning_content")
+            prediction = get_answer_value(states[i])
+            details.append(
+                {
+                    "question_index": i,
+                    "label": labels[i],
+                    "prediction": prediction,
+                    "correct": prediction == labels[i],
+                    "invalid": prediction == INVALID,
+                    "content": states[i],
+                    "reasoning": reasoning,
+                    "finish_reason": choice.get("finish_reason"),
+                    "stop_reason": choice.get("stop_reason"),
+                    "completion_tokens": output_tokens[i],
+                    **record,
+                }
+            )
+        with open(save_details, "x") as stream:
+            for detail in details:
+                stream.write(json.dumps(detail, ensure_ascii=False) + "\n")
+        result["diagnostics"] = {
+            "request_errors": sum(bool(d.get("error")) for d in details),
+            "finished_by_length": sum(d["finish_reason"] == "length" for d in details),
+            "invalid_with_length": sum(
+                d["invalid"] and d["finish_reason"] == "length" for d in details
+            ),
+            "invalid_with_stop": sum(
+                d["invalid"] and d["finish_reason"] == "stop" for d in details
+            ),
+            "invalid_empty_content": sum(
+                d["invalid"] and not d["content"].strip() for d in details
+            ),
+            "invalid_reasoning_only": sum(
+                d["invalid"] and not d["content"].strip() and bool(d["reasoning"])
+                for d in details
+            ),
+        }
+        result["details_file"] = save_details
+        print(f"Diagnostics: {json.dumps(result['diagnostics'])}")
+        print(f"Per-question details saved to {save_details}")
+    return result
 
 
 def evaluate_gsm8k_offline(
@@ -358,7 +452,9 @@ def evaluate_gsm8k_offline(
     sampling_params = SamplingParams(
         temperature=temperature,
         max_tokens=max_tokens,
-        stop=["Question", "Assistant:", "<|separator|>"],
+        stop=None
+        if use_chat_completions
+        else ["Question", "Assistant:", "<|separator|>"],
     )
     mode = "chat" if use_chat_completions else "completion"
     print(
@@ -434,6 +530,7 @@ def main() -> None:
         type=json.loads,
         help="JSON chat_template_kwargs, e.g. '{\"enable_thinking\": false}'",
     )
+    parser.add_argument("--min-p", type=float, help="Minimum relative probability")
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
@@ -449,11 +546,21 @@ def main() -> None:
         help="Timeout for each request, including time waiting for a connection",
     )
     parser.add_argument("--save-results", type=str, help="Save results to JSON file")
+    parser.add_argument(
+        "--save-details", type=str, help="Save per-question replies and errors to JSONL"
+    )
 
     args = parser.parse_args()
     temperature = args.temperature
     if temperature is None and not args.use_chat_completions:
         temperature = 0.0
+
+    if args.top_p is not None and not 0 < args.top_p <= 1:
+        parser.error("--top-p must be in (0, 1]")
+    if args.top_k is not None and args.top_k < -1:
+        parser.error("--top-k must be -1 or a non-negative integer")
+    if args.min_p is not None and not 0 <= args.min_p <= 1:
+        parser.error("--min-p must be in [0, 1]")
 
     result = evaluate_gsm8k(
         num_questions=args.num_questions,
@@ -469,6 +576,8 @@ def main() -> None:
         use_chat_completions=args.use_chat_completions,
         top_p=args.top_p,
         top_k=args.top_k,
+        min_p=args.min_p,
+        save_details=args.save_details,
         reasoning_effort=args.reasoning_effort,
         chat_template_kwargs=args.chat_template_kwargs,
     )
@@ -491,6 +600,7 @@ def main() -> None:
             "temperature": temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
+            "min_p": args.min_p,
             "seed": args.seed,
             "stop": None
             if args.use_chat_completions

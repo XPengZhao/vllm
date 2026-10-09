@@ -203,6 +203,16 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             vllm_config=vllm_config, start_layer_id=start_layer_id, prefix=prefix
         )
         config = self.config
+        # Match the backbone's nested-over-top-level checkpoint settings.
+        dspark_config = getattr(config, "dflash_config", None) or {}
+        for key in (
+            "markov_rank",
+            "markov_head_type",
+            "enable_confidence_head",
+            "confidence_head_with_markov",
+        ):
+            if key in dspark_config:
+                setattr(config, key, dspark_config[key])
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )
