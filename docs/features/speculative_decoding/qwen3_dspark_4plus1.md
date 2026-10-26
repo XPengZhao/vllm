@@ -1,0 +1,152 @@
+# Qwen3-4B DSpark 4+1: seven proposals with concurrent bank execution
+
+This branch supports dense 4+1 checkpoints trained with either SpecForge's
+v3 `4+1-bank13-draft7-uniform-lag0to8-v3` semantics or the earlier v2
+`4+1-shared-mask-uniform-lag0to7-v2` semantics. Both propose all seven trained
+outputs. Ordinary DSpark continues to use the existing speculator.
+
+Legacy exports containing only `"late_conditioning": {"enabled": true}` use
+a twelve-state bank and lag 0..7. They can be served directly without retraining
+or changing their config. Explicit `bank_size: 12, max_context_lag: 7` is also
+supported. Keep the original bank width: its bidirectional attention affects
+every selected state.
+
+## Training and export of new thirteen-state models
+
+Use SpecForge branch `codex/dspark-v1.5-4plus1-overlap` with
+`model.draft_model_config=configs/qwen3-4b-dspark-4plus1.json`. It trains a
+thirteen-state bank, uniformly sampled lag 0..8, and seven next-token labels.
+Starting from the old 12-state run requires a **weights-only warm start** in a
+new run: `model.draft_checkpoint_path=/path/to/old-step`. Keep
+`training.resume_from` unset for that transition. Optimizer, LR schedule and
+data position start anew; a v3 checkpoint subsequently supports exact resume.
+
+Export a newly trained v3 checkpoint (existing legacy exports need no re-export):
+
+```bash
+cd "$HOME/SpecForge"
+source .venv/bin/activate
+specforge export --to hf \
+  --checkpoint "$HOME/outputs/qwen3-4b/NEW_RUN/NEW_RUN-step2616" \
+  --draft-config configs/qwen3-4b-dspark-4plus1.json \
+  --embedding-source /data1/models/Qwen3-4B \
+  --output-dir /data1/models/dspark-4plus1-bank13-step2616
+```
+
+## Serve
+
+Use the vLLM branch with the same name and its usual installed environment:
+
+```bash
+cd "$HOME/vllm"
+source .venv/bin/activate
+CUDA_VISIBLE_DEVICES=0 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /data1/models/Qwen3-4B \
+  --served-model-name qwen3-4b \
+  --port 11443 \
+  --dtype bfloat16 \
+  --max-model-len 8192 \
+  --max-num-seqs 8 \
+  --no-async-scheduling \
+  --no-enable-prefix-caching \
+  --speculative-config '{"method":"dspark","model":"/data1/models/dspark-4plus1-bank13-step2616","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+```
+
+Supported scope: one GPU, unquantized text Qwen3 target/draft, vanilla Markov
+head, fixed seven-token proposals. Greedy and probabilistic drafting use the
+existing DSpark sampler and standard vLLM rejection sampling. Adaptive
+verification, distributed parallelism, LoRA, watermarking and KV transfer are
+rejected. Requests can batch, finish, be preempted and reuse slots. Chunked
+prefill is supported; its final chunk bootstraps from the complete prefix.
+
+For an existing legacy export, change only the draft `model` path above, for
+example to `$HOME/models/qwen3-4b/dspark-4plus1-20261022-175740-step2616`.
+Keep `num_speculative_tokens: 7`. The startup log reports `bank12` or `bank13`.
+
+The draft batches projections and FFNs across requests and packs variable-length
+context K/V for FlashAttention, without padding to the longest request. Each of
+the seven Markov sampling steps processes the active batch together. Request
+bookkeeping stays on the CPU; draft CUDA graph capture is not yet implemented.
+Target CUDA graphs remain supported. The draft uses a private bounded context
+K/V pool. The pool is reserved at model
+load and included in memory profiling; it costs about 1.25 GiB at 8 requests
+and 8192 tokens for Qwen3-4B BF16. Set `--max-num-seqs` and `--max-model-len`
+explicitly: large defaults can reserve excessive memory. Temporary bank K/V
+never enter the persistent context cache.
+
+## Dependency and position contract
+
+At the start of a verification anchored at t, the committed context covers
+positions <t. The runner records a prefix-ready CUDA event **before** enqueuing
+target forward. Once target kernels are enqueued, it launches the four-layer
+bank on a separate stream waiting only on that earlier event. This is not a
+`wait_stream(main)` after target forward, which would serialize the two.
+
+The bank contains thirteen pure MASK slots t+2..t+14 and never reads the new
+bonus or current-block target features. If r=0..7 proposals are accepted, the
+next anchor is b=t+r+1. The selected six states are bank[r:r+6], at b+1..b+6.
+The final stage waits for both verification and bank completion, appends only
+accepted target features, then computes [adapted bonus, six states] at b..b+6.
+All seven outputs predict b+1..b+7. The thirteen-state model needs no
+full-acceptance fallback. First-request prefill uses bank start b+1 with the
+full prompt prefix.
+
+Legacy banks cover t+2..t+13. When r=0..6, the six selected states are in range
+and the lag is 1..7, matching training. When r=7, the runner waits for the
+outstanding bank read, commits the eight verified context positions, and
+rebuilds a twelve-state bank at b+1 using that complete accepted prefix. This
+uses the legacy training's lag-zero bootstrap path and still produces seven
+tokens. It adds synchronous bank work on full-acceptance rounds; other rounds
+reuse the overlapped bank. Serial mode uses the same boundary policy.
+
+Target and draft stages have distinct context K/V and use no shared vLLM
+attention/workspace buffers. Request removal waits on outstanding bank reads
+before its cache slot can be reused. CPU-side length resolution after sampling
+currently synchronizes once per batch; this path prioritizes correctness over
+maximum throughput and does not claim a measured speedup.
+
+## Validate on the server
+
+With both checkouts available and SpecForge on PYTHONPATH:
+
+```bash
+cd "$HOME/vllm"
+PYTHONPATH="$HOME/SpecForge:$HOME/vllm" .venv/bin/python -m pytest -v \
+  tests/models/test_dspark_late.py \
+  tests/models/test_dspark_late_runtime.py \
+  tests/models/test_dspark_late_e2e.py
+```
+
+Stage tests compare actual serving operations against SpecForge training for
+bootstrap and every r=0..7 boundary in FP32/BF16. Runtime tests cover reordered
+batches, mixed r=0/r=7, chunked prefill and slot reuse. CUDA tests check stage
+parity, measured GPU overlap with a synthetic verifier interval, and a real
+tiny Qwen3 vLLM engine against target-only greedy outputs, including stochastic
+sampling smoke. The synthetic overlap test is not a throughput result for the
+real target; run GSM8K on the real exported checkpoint as well.
+
+For a serial scheduling control that preserves the same old-prefix banks, set
+`dflash_config.late_conditioning.overlap` to `false` in the **exported draft's
+config.json**, then restart the server. Keep every other config field unchanged:
+
+```json
+"overlap": false
+```
+
+Add this field inside the existing `late_conditioning` object, preserving its
+bank/lag fields (or their absence in legacy exports). Restore `overlap` to
+`true` (or remove that field) to enable concurrency again.
+The serving CLI's global `--hf-overrides` does not override this draft config.
+
+For a GPU timeline, add a torch profiler configuration, call `/start_profile`,
+send several warm requests, then call `/stop_profile`:
+
+```bash
+--profiler-config '{"profiler":"torch","torch_profiler_dir":"/home/user/logs/4plus1-traces","torch_profiler_with_stack":false}'
+```
+
+Inspect `dspark4plus1.prepare_bank` and `dspark4plus1.finish` in the worker
+trace. Confirm bank kernels run on a different CUDA stream and overlap target
+verification kernels; CPU scope overlap alone is insufficient. Compare serial
+and concurrent runs under identical prompts, sampling, cache and concurrency
+settings. This checkout was developed without a CUDA device: real GPU serving,
+overlap duration and end-to-end speedup require the server validation above.

@@ -1113,6 +1113,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
+        if self.speculator is not None and hasattr(self.speculator, "remove_request"):
+            self.speculator.remove_request(req_id)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1984,6 +1986,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
+        # Freeze the 4+1 prefix dependency before enqueuing target verification.
+        if (
+            not dummy_run
+            and self.speculator is not None
+            and hasattr(self.speculator, "begin_verification")
+        ):
+            with use_workspace_lane(self._draft_workspace_lane):
+                self.speculator.begin_verification(input_batch)
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2033,6 +2044,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if (
+            not dummy_run
+            and self.speculator is not None
+            and hasattr(self.speculator, "launch_verification_bank")
+        ):
+            self.speculator.launch_verification_bank()
 
         self.kv_connector.finish_forward()
 

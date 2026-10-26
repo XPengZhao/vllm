@@ -1,0 +1,243 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Dense DSpark late-conditioning stages, with request-owned context K/V.
+
+Batched projections and variable-length attention use no target workspace,
+paged-cache writes, collectives, or forward-context mutation.
+"""
+
+from itertools import accumulate
+
+import torch
+import torch.nn.functional as F
+
+
+def rms_norm(x, norm):
+    value = x.float()
+    value = value * torch.rsqrt(
+        value.square().mean(-1, keepdim=True) + norm.variance_epsilon
+    )
+    return norm.weight * value.to(x.dtype)
+
+
+def device_ints(values, device, dtype=torch.long):
+    return torch.tensor(
+        values, dtype=dtype, pin_memory=torch.device(device).type == "cuda"
+    ).to(device, non_blocking=True)
+
+
+def packed_rows(lengths, device):
+    offsets = device_ints([0, *accumulate(lengths)], device, dtype=torch.int32)
+    owners = torch.repeat_interleave(
+        torch.arange(len(lengths), device=device),
+        device_ints(lengths, device),
+        output_size=sum(lengths),
+    )
+    local = torch.arange(sum(lengths), device=device) - offsets[owners]
+    return owners, local, offsets
+
+
+class LateConditioningStages:
+    def __init__(self, model, max_requests, max_length, device, dtype):
+        self.model = model
+        self.backbone = model.model
+        config = model.config
+        late = config.dflash_config["late_conditioning"]
+        self.bank_size = late.get("bank_size", 12)
+        self.head_dim = config.head_dim
+        self.n_heads = config.num_attention_heads
+        self.n_kv_heads = config.num_key_value_heads
+        self.hidden = config.hidden_size
+        self.max_length = max_length
+        self.varlen_attention = None
+        if torch.device(device).type == "cuda":
+            from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+            self.varlen_attention = flash_attn_varlen_func
+        theta = config.rope_parameters.get("rope_theta", 1000000.0)
+        self.inv_freq = 1.0 / (
+            theta
+            ** (
+                torch.arange(0, self.head_dim, 2, device=device).float() / self.head_dim
+            )
+        )
+        if torch.device(device).type == "cuda":
+            required = (
+                5
+                * 2
+                * max_requests
+                * max_length
+                * self.n_kv_heads
+                * self.head_dim
+                * torch.empty((), dtype=dtype).element_size()
+            )
+            free, _ = torch.accelerator.get_memory_info(device)
+            if required > free:
+                raise ValueError(
+                    "4+1 context reservation exceeds free GPU memory; reduce "
+                    "--max-num-seqs or --max-model-len"
+                )
+        # Allocated at model load, so vLLM's memory profiling accounts for it.
+        self.kv = torch.empty(
+            5,
+            2,
+            max_requests,
+            max_length,
+            self.n_kv_heads,
+            self.head_dim,
+            device=device,
+            dtype=dtype,
+        )
+
+    def rope(self, x, positions):
+        angles = positions.float()[:, None] * self.inv_freq[None, :]
+        angles = torch.cat((angles, angles), -1)[:, None, :]
+        cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+        left, right = x.chunk(2, -1)
+        return x * cos + torch.cat((-right, left), -1) * sin
+
+    def append_context(self, slot, start, features):
+        self.append_context_batch([slot], [start], features, [features.shape[0]])
+
+    def append_context_batch(self, slots, starts, features, lengths):
+        if any(
+            not 0 <= start <= start + n <= self.max_length
+            for start, n in zip(starts, lengths)
+        ):
+            raise ValueError("4+1 context exceeds the reserved cache")
+        if not sum(lengths):
+            return
+        owners, local, _ = packed_rows(lengths, features.device)
+        rows = device_ints(slots, features.device)[owners]
+        positions = device_ints(starts, features.device)[owners] + local
+        context = rms_norm(
+            F.linear(features, self.backbone.fc.weight), self.backbone.hidden_norm
+        )
+        for index, layer in enumerate(self.backbone.layers):
+            attn = layer.self_attn
+            kv = F.linear(context, attn.qkv_proj.weight[attn.q_size :])
+            k, v = kv.chunk(2, -1)
+            k = rms_norm(k.view(-1, self.n_kv_heads, self.head_dim), attn.k_norm)
+            k = self.rope(k, positions)
+            self.kv[index, 0, rows, positions] = k
+            self.kv[index, 1, rows, positions] = v.view(
+                -1, self.n_kv_heads, self.head_dim
+            )
+
+    def batch_layout(self, slots, lengths, width):
+        device = self.kv.device
+        owners, local, context_offsets = packed_rows(lengths, device)
+        cu_q = torch.arange(len(slots) + 1, device=device, dtype=torch.int32) * width
+        cu_k = context_offsets + cu_q
+        context_dst = torch.arange(sum(lengths), device=device) + owners * width
+        query_dst = (cu_k[1:] - width)[:, None] + torch.arange(width, device=device)
+        return (
+            device_ints(slots, device)[owners],
+            local,
+            context_dst,
+            query_dst.flatten(),
+            cu_q,
+            cu_k,
+            lengths,
+            width,
+        )
+
+    def layer_batch(self, index, states, positions, layout):
+        layer = self.backbone.layers[index]
+        attn = layer.self_attn
+        residual = states
+        x = rms_norm(states, layer.input_layernorm)
+        qkv = F.linear(x, attn.qkv_proj.weight)
+        q, k, v = qkv.split((attn.q_size, attn.kv_size, attn.kv_size), -1)
+        q = self.rope(
+            rms_norm(q.view(-1, self.n_heads, self.head_dim), attn.q_norm), positions
+        )
+        k = self.rope(
+            rms_norm(k.view(-1, self.n_kv_heads, self.head_dim), attn.k_norm), positions
+        )
+        rows, local, ctx_dst, query_dst, cu_q, cu_k, lengths, width = layout
+        total = sum(lengths) + len(lengths) * width
+        packed_k = k.new_empty(total, self.n_kv_heads, self.head_dim)
+        packed_v = torch.empty_like(packed_k)
+        packed_k[ctx_dst] = self.kv[index, 0, rows, local]
+        packed_v[ctx_dst] = self.kv[index, 1, rows, local]
+        packed_k[query_dst] = k
+        packed_v[query_dst] = v.view(-1, self.n_kv_heads, self.head_dim)
+        # Context is read-only; temporary bank K/V never enter the cache.
+        if self.varlen_attention is not None:
+            y = self.varlen_attention(
+                q=q,
+                k=packed_k,
+                v=packed_v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=width,
+                max_seqlen_k=max(lengths) + width,
+                causal=False,
+            )
+        else:
+            # CPU reference for tests; CUDA always uses one varlen call.
+            outputs, start = [], 0
+            for i, length in enumerate(lengths):
+                end = start + length + width
+                outputs.append(
+                    F.scaled_dot_product_attention(
+                        q[i * width : (i + 1) * width].transpose(0, 1).unsqueeze(0),
+                        packed_k[start:end].transpose(0, 1).unsqueeze(0),
+                        packed_v[start:end].transpose(0, 1).unsqueeze(0),
+                        is_causal=False,
+                        enable_gqa=True,
+                    )
+                    .squeeze(0)
+                    .transpose(0, 1)
+                )
+                start = end
+            y = torch.cat(outputs)
+        y = y.reshape(states.shape[0], -1)
+        x = residual + F.linear(y, attn.o_proj.weight)
+        gate, up = F.linear(
+            rms_norm(x, layer.post_attention_layernorm), layer.mlp.gate_up_proj.weight
+        ).chunk(2, -1)
+        return x + F.linear(F.silu(gate) * up, layer.mlp.down_proj.weight)
+
+    def prepare_bank(self, slot, length, bank_start):
+        return self.prepare_bank_batch([slot], [length], [bank_start])[0]
+
+    def prepare_bank_batch(self, slots, lengths, bank_starts):
+        states = self.backbone.future_mask.expand(len(slots) * self.bank_size, -1)
+        positions = (
+            device_ints(bank_starts, states.device)[:, None]
+            + torch.arange(self.bank_size, device=states.device)
+        ).flatten()
+        layout = self.batch_layout(slots, lengths, self.bank_size)
+        for index in range(4):
+            states = self.layer_batch(index, states, positions, layout)
+        return states.view(len(slots), self.bank_size, -1)
+
+    def finish(self, slot, length, bank, bank_start, bonus_embedding):
+        return self.finish_batch(
+            [slot],
+            [length],
+            bank.unsqueeze(0),
+            [bank_start],
+            bonus_embedding.reshape(1, -1),
+        )[0]
+
+    def finish_batch(self, slots, lengths, banks, bank_starts, bonus_embeddings):
+        offsets = [length + 1 - start for length, start in zip(lengths, bank_starts)]
+        if any(not 0 <= offset <= banks.shape[1] - 6 for offset in offsets):
+            raise ValueError("4+1 bank does not cover this acceptance boundary")
+        indices = device_ints(offsets, banks.device)[:, None] + torch.arange(
+            6, device=banks.device
+        )
+        selected = banks.gather(1, indices[..., None].expand(-1, -1, self.hidden))
+        anchor = F.linear(bonus_embeddings, self.backbone.anchor_adapter.weight)
+        states = torch.cat((anchor[:, None], selected), dim=1).flatten(0, 1)
+        positions = (
+            device_ints(lengths, banks.device)[:, None]
+            + torch.arange(7, device=banks.device)
+        ).flatten()
+        states = self.layer_batch(
+            4, states, positions, self.batch_layout(slots, lengths, 7)
+        )
+        return rms_norm(states, self.backbone.norm).view(len(slots), 7, -1)

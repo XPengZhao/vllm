@@ -43,6 +43,17 @@ def init_speculator(
 
         return DFlashSpeculator(vllm_config, device)
     elif speculative_config.method == "dspark":
+        hf = speculative_config.draft_model_config.hf_config
+        if (
+            (getattr(hf, "dflash_config", None) or {})
+            .get("late_conditioning", {})
+            .get("enabled", False)
+        ):
+            from vllm.v1.worker.gpu.spec_decode.dspark.late_speculator import (
+                LateDSparkSpeculator,
+            )
+
+            return LateDSparkSpeculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,
         )

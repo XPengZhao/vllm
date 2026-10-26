@@ -1,0 +1,339 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Seven-token 4+1 drafting with bank execution on a separate CUDA stream."""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+import torch
+
+from vllm.logger import init_logger
+from vllm.model_executor.models.dspark_late import LateConditioningStages, device_ints
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+logger = init_logger(__name__)
+
+
+@dataclass
+class RequestContext:
+    slot: int
+    length: int = 0
+    bank: torch.Tensor | None = None
+    bank_start: int = 0
+    ready: torch.cuda.Event | None = None
+
+
+def validate_late_config(config):
+    spec = config.speculative_config
+    hf = spec.draft_model_config.hf_config
+    late = hf.dflash_config["late_conditioning"]
+    if (
+        hf.num_hidden_layers != 5
+        or hf.block_size != 7
+        or (late.get("bank_size", 12), late.get("max_context_lag", 7))
+        not in ((12, 7), (13, 8))
+    ):
+        raise ValueError(
+            "4+1 requires five layers, block_size=7, and bank12/lag7 or bank13/lag8; "
+            f"got layers={hf.num_hidden_layers}, block_size={hf.block_size}, "
+            f"late_conditioning={late}"
+        )
+    parallel = config.parallel_config
+    if (
+        any(
+            getattr(parallel, name, 1) != 1
+            for name in (
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "data_parallel_size",
+                "decode_context_parallel_size",
+                "prefill_context_parallel_size",
+            )
+        )
+        or spec.draft_parallel_config.tensor_parallel_size != 1
+    ):
+        raise ValueError("4+1 overlap currently requires TP=PP=DP=CP=1")
+    if config.scheduler_config.async_scheduling:
+        raise ValueError("4+1 requires --no-async-scheduling")
+    if getattr(parallel, "enable_dbo", False):
+        raise ValueError("4+1 does not support dual batch overlap")
+    if config.model_config.hf_config.model_type != "qwen3":
+        raise ValueError("4+1 currently supports Qwen3 targets only")
+    if config.cache_config.enable_prefix_caching:
+        raise ValueError("4+1 requires --no-enable-prefix-caching")
+    if (
+        spec.num_speculative_tokens != 7
+        or spec.enable_adaptive_verification
+        or spec.num_speculative_tokens_per_batch_size is not None
+    ):
+        raise ValueError("4+1 requires fixed seven-token proposals")
+    if config.model_config.quantization or spec.quantization:
+        raise ValueError("4+1 requires unquantized target and draft weights")
+    if config.lora_config is not None or config.model_config.supports_multimodal_inputs:
+        raise ValueError("4+1 currently supports text-only models without LoRA")
+    if getattr(config, "kv_transfer_config", None) is not None:
+        raise ValueError("4+1 requires local prefill, without KV transfer")
+    if getattr(config, "watermark_config", None) is not None:
+        raise ValueError("4+1 does not support watermarking")
+    nested = hf.dflash_config
+    if (
+        nested.get("markov_head_type", "vanilla") != "vanilla"
+        or any(
+            nested.get(key, {}).get("enabled", False)
+            for key in ("moe", "attention_moe")
+        )
+        or hf.attention_bias
+        or hf.hidden_act != "silu"
+        or any(t != "full_attention" for t in hf.layer_types)
+        or hf.rope_parameters.get("rope_type", "default") != "default"
+        or getattr(hf, "is_neox_style", True) is not True
+    ):
+        raise ValueError("4+1 requires dense vanilla Qwen3 and default RoPE")
+    if spec.dspark_draft_topk is not None or getattr(hf, "dspark_draft_topk", None):
+        raise ValueError("4+1 uses the full vocabulary, without draft top-k")
+
+
+class LateDSparkSpeculator(DraftModelSpeculator):
+    # Reuse the existing greedy/probabilistic sampler and rejection distribution.
+    _sample_logits: Callable[..., torch.Tensor] = DSparkSpeculator._sample_logits
+
+    def __init__(self, config, device):
+        validate_late_config(config)
+        super().__init__(config, device)
+        late = self.draft_model_config.hf_config.dflash_config["late_conditioning"]
+        self.overlap = late.get("overlap", True)
+        if not isinstance(self.overlap, bool):
+            raise ValueError("late_conditioning.overlap must be a boolean")
+        self.stream = torch.cuda.Stream(device=device)
+        self.contexts: dict[str, RequestContext] = {}
+        self._step_cols = torch.arange(7, dtype=torch.int32, device=device)
+        self._d2t_scatter_index = None
+        self._draft_scatter_buf = None
+        self.num_query_per_req = 7
+        self.pending_jobs = []
+
+    def load_draft_model(self, target_model, target_attn_layer_names):
+        model = load_dspark_model(target_model, self.vllm_config)
+        if model.draft_id_to_target_id is not None:
+            raise ValueError("4+1 requires the full target vocabulary")
+        self.stages = LateConditioningStages(
+            model, self.max_num_reqs, self.max_model_len, self.device, self.dtype
+        )
+        logger.info(
+            "DSpark 4+1: bank%d, draft7, overlap=%s, reserved context K/V %.2f GiB",
+            self.stages.bank_size,
+            self.overlap,
+            self.stages.kv.numel() * self.stages.kv.element_size() / 2**30,
+        )
+        # Stages own their context K/V. Do not allocate an unused paged cache
+        # for the regular Attention modules whose weights they reuse.
+        registry = self.vllm_config.compilation_config.static_forward_context
+        for layer in model.model.layers:
+            registry.pop(layer.self_attn.attn.layer_name)
+        return model
+
+    def set_attn(self, *args, **kwargs):
+        pass  # Packed attention does not need paged-attention metadata.
+
+    def init_cudagraph_manager(self, cudagraph_mode):
+        pass  # Target CUDA graphs are supported; the two draft stages are eager.
+
+    def capture(self):
+        pass
+
+    def remove_request(self, req_id):
+        state = self.contexts.pop(req_id, None)
+        if state is not None and state.ready is not None:
+            assert state.bank is not None
+            torch.cuda.current_stream(self.device).wait_event(state.ready)
+            state.bank.record_stream(torch.cuda.current_stream(self.device))
+
+    @torch.inference_mode()
+    def begin_verification(self, input_batch):
+        """Snapshot old-prefix jobs and the event before target forward."""
+        main = torch.cuda.current_stream(self.device)
+        jobs = []
+        for i, req_id in enumerate(input_batch.req_ids):
+            state = self.contexts.get(req_id)
+            if state is None:
+                continue  # Prefill/bootstrap has no prior bank to overlap.
+            # The CPU token count is an upper bound. Use our committed prefix
+            # here and validate against target GPU positions after verification.
+            if (
+                input_batch.num_draft_tokens_per_req is None
+                or not input_batch.num_draft_tokens_per_req[i]
+            ):
+                continue  # Chunked prefill must bootstrap from its full prefix.
+            jobs.append(state)
+        self.pending_jobs = jobs
+        self.prefix_ready = torch.cuda.Event()
+        self.prefix_ready.record(main)
+
+    @torch.inference_mode()
+    def launch_verification_bank(self):
+        """Target kernels are enqueued; depend only on the pre-forward event."""
+        jobs, self.pending_jobs = self.pending_jobs, []
+        if not jobs:
+            return
+        stream = self.stream if self.overlap else torch.cuda.current_stream(self.device)
+        stream.wait_event(self.prefix_ready)
+        with (
+            torch.cuda.stream(stream),
+            torch.autograd.profiler.record_function("dspark4plus1.prepare_bank"),
+        ):
+            for state in jobs:
+                if state.bank is not None:
+                    raise RuntimeError(
+                        "4+1 bank from the previous round was not consumed"
+                    )
+                state.bank_start = state.length + 2
+            banks = self.stages.prepare_bank_batch(
+                [state.slot for state in jobs],
+                [state.length for state in jobs],
+                [state.bank_start for state in jobs],
+            )
+            ready = torch.cuda.Event()
+            ready.record(stream)
+            for state, bank in zip(jobs, banks.unbind(0)):
+                state.bank = bank
+                state.ready = ready
+
+    @torch.inference_mode()
+    def propose(
+        self,
+        input_batch,
+        attn_metadata,
+        slot_mappings,
+        last_hidden_states,
+        aux_hidden_states,
+        num_sampled,
+        num_rejected,
+        last_sampled,
+        next_prefill_tokens,
+        temperature,
+        seeds,
+        dp_sync=None,
+        dummy_run=False,
+        skip_attn_for_dummy_run=False,
+        mm_inputs=None,
+        is_profile=False,
+        num_speculative_tokens=None,
+    ):
+        if dummy_run:
+            # Pool memory was reserved at load. Exercise both stages so memory
+            # profiling includes temporary attention/bank activations as well.
+            feature_width = self.model.model.fc.weight.shape[1]
+            batch = max(1, input_batch.num_reqs)
+            length = max(1, min(input_batch.num_tokens // batch, self.max_model_len))
+            slots, lengths = list(range(batch)), [length] * batch
+            features = torch.zeros(
+                batch * length, feature_width, device=self.device, dtype=self.dtype
+            )
+            self.stages.append_context_batch(slots, [0] * batch, features, lengths)
+            banks = self.stages.prepare_bank_batch(slots, lengths, [length + 1] * batch)
+            hidden = self.stages.finish_batch(
+                slots,
+                lengths,
+                banks,
+                [length + 1] * batch,
+                features[:batch, : self.hidden_size],
+            )
+            self.model.compute_draft_logits(hidden.flatten(0, 1))
+            return self.draft_tokens[: input_batch.num_reqs].fill_(0)
+        if not aux_hidden_states:
+            raise ValueError("4+1 requires target auxiliary features")
+        main = torch.cuda.current_stream(self.device)
+        # Resolve scalar lengths once after verification. Bank execution is
+        # already in flight and can overlap both target forward and sampling.
+        starts = input_batch.positions[
+            input_batch.query_start_loc[: input_batch.num_reqs].long()
+        ]
+        counts = torch.stack((num_sampled, num_rejected, starts)).cpu().tolist()
+        features = torch.cat(aux_hidden_states, dim=-1)
+        self._copy_request_inputs(
+            input_batch.num_reqs, input_batch.idx_mapping, temperature, seeds
+        )
+        output = self.draft_tokens[: input_batch.num_reqs]
+        output.fill_(-1)
+        updates, active, rebuild = [], [], []
+        waited = set()
+        for i, req_id in enumerate(input_batch.req_ids):
+            slot = int(input_batch.idx_mapping_np[i])
+            start = counts[2][i]
+            left, right = map(int, input_batch.query_start_loc_np[i : i + 2])
+            state = self.contexts.setdefault(req_id, RequestContext(slot))
+            if state.slot != slot or state.length != start:
+                raise ValueError(
+                    "4+1 request slot/cursor changed without reset: "
+                    f"request={req_id}, cached_slot={state.slot}, target_slot={slot}, "
+                    f"cached_prefix={state.length}, target_position={start}"
+                )
+            end = right - counts[1][i]
+            if not left <= end <= right:
+                raise ValueError("invalid 4+1 accepted-context length")
+            if state.ready is not None:
+                assert state.bank is not None
+                if state.ready not in waited:
+                    main.wait_event(state.ready)
+                    waited.add(state.ready)
+                state.bank.record_stream(main)
+            updates.append((slot, start, left, end))
+            state.length += end - left
+            if not counts[0][i]:
+                state.bank = state.ready = None
+                continue  # Non-final chunked prefill.
+            if self.stages.bank_size == 12 and state.length - start > 7:
+                # Legacy training covers lag 0..7. After full acceptance,
+                # rebuild with the committed prefix using its lag-zero path.
+                state.bank = state.ready = None
+            if state.bank is None:
+                state.bank_start = state.length + 1
+                rebuild.append(state)
+            active.append((i, state))
+        if updates:
+            self.stages.append_context_batch(
+                [u[0] for u in updates],
+                [u[1] for u in updates],
+                torch.cat([features[left:end] for _, _, left, end in updates]),
+                [end - left for _, _, left, end in updates],
+            )
+        if rebuild:
+            banks = self.stages.prepare_bank_batch(
+                [s.slot for s in rebuild],
+                [s.length for s in rebuild],
+                [s.bank_start for s in rebuild],
+            )
+            for state, bank in zip(rebuild, banks.unbind(0)):
+                state.bank = bank
+        if not active:
+            return output
+        with torch.autograd.profiler.record_function("dspark4plus1.finish"):
+            batch_rows = device_ints([i for i, _ in active], self.device)
+            mapping = input_batch.idx_mapping[batch_rows]
+            bonus = last_sampled[mapping.long(), 0]
+            lengths = [s.length for _, s in active]
+            hidden = self.stages.finish_batch(
+                [s.slot for _, s in active],
+                lengths,
+                torch.stack([s.bank for _, s in active]),
+                [s.bank_start for _, s in active],
+                self.model.model.embed_tokens(bonus),
+            )
+            logits = self.model.compute_draft_logits(hidden.flatten(0, 1)).view(
+                len(active), 7, -1
+            )
+            prev = bonus
+            positions = device_ints(lengths, self.device)
+            for step in range(7):
+                corrected = logits[:, step] + self.model.markov_bias(
+                    self.model.markov_embed(prev)
+                )
+                prev = self._sample_logits(
+                    corrected, mapping, positions + step + 1, step
+                )
+                output[batch_rows, step] = prev
+        for _, state in active:
+            state.bank = state.ready = None
+        return output

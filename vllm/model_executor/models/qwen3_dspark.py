@@ -203,6 +203,14 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             vllm_config=vllm_config, start_layer_id=start_layer_id, prefix=prefix
         )
         config = self.config
+        late = (getattr(config, "dflash_config", None) or {}).get(
+            "late_conditioning", {}
+        )
+        if late.get("enabled", False):
+            self.future_mask = nn.Parameter(torch.empty(config.hidden_size))
+            self.anchor_adapter = nn.Linear(
+                config.hidden_size, config.hidden_size, bias=False
+            )
         # Match the backbone's nested-over-top-level checkpoint settings.
         dspark_config = getattr(config, "dflash_config", None) or {}
         for key in (
@@ -350,6 +358,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         # the target by load_dspark_model, so skip the unloaded params here.
         uses_expanded_input_vocab = self.config.vocab_size > self.target_vocab_size
         uses_reduced_vocab = self.config.draft_vocab_size < self.target_vocab_size
+        if hasattr(self.model, "future_mask"):
+            required = {"model.future_mask", "model.anchor_adapter.weight"}
+            if not required.issubset(model_weights):
+                raise ValueError("4+1 checkpoint lacks MASK or anchor adapter weights")
         if uses_expanded_input_vocab and not includes_embed_tokens:
             raise ValueError(
                 "Qwen3 DSpark checkpoints whose input vocab_size is larger than "

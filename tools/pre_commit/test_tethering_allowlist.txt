@@ -56,5 +56,10 @@ tests/v1/kv_connector/nixl_integration/test_disagg_accuracy.py  # run by intel_j
 # tests/platforms/
 tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platforms/
 
+# DSpark 4+1 experiments require the matching, separate SpecForge checkout.
+tests/models/test_dspark_late.py  # cross-repository stage parity; run manually with SpecForge on PYTHONPATH
+tests/models/test_dspark_late_runtime.py  # cross-repository runtime parity and CUDA overlap; run manually with SpecForge
+tests/models/test_dspark_late_e2e.py  # CUDA engine test generates weights through matching SpecForge; run manually
+
 # tests/tools/
 tests/tools/test_config_validator.py  # logic covered by the validate-config pre-commit hook; no test_areas job
