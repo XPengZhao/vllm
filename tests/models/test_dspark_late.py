@@ -24,7 +24,7 @@ spec.loader.exec_module(module)
 LateConditioningStages = module.LateConditioningStages
 
 
-def pair(dtype=torch.float32, device="cpu", bank_size=13):
+def pair(dtype=torch.float32, device="cpu", bank_size=13, max_length=128):
     reference_module = pytest.importorskip("specforge.modeling.draft.dspark")
     config = Qwen3Config(
         vocab_size=32,
@@ -93,7 +93,7 @@ def pair(dtype=torch.float32, device="cpu", bank_size=13):
     config.dflash_config["late_conditioning"] = dict(
         enabled=True, bank_size=bank_size, max_context_lag=bank_size - 5
     )
-    return reference, LateConditioningStages(serving, 2, 128, device, dtype)
+    return reference, LateConditioningStages(serving, 2, max_length, device, dtype)
 
 
 def legacy_training_forward(ref, context, bonus, anchor, old):
@@ -280,3 +280,191 @@ def test_packed_batch_matches_independent_training_with_unequal_contexts(
     # Bank/self attention must never persist speculative K/V.
     for slot, n in zip(slots, lengths):
         torch.testing.assert_close(stages.kv[:, :, slot, :n], cached[:, :, slot, :n])
+
+
+@pytest.mark.parametrize("bank_size", [12, 13])
+@pytest.mark.parametrize("lengths", [[0, 0], [0, 73], [73, 0], [5, 31]])
+@torch.inference_mode()
+def test_graph_packed_capacity_matches_eager_without_padding_leak(bank_size, lengths):
+    _, stages = pair(bank_size=bank_size)
+    slots = [1, 0]
+    context = torch.randn(sum(lengths), 32)
+    stages.append_context_batch(slots, [0, 0], context, lengths)
+    # Three graph rows but only two real requests; the last row is padding.
+    # Run the exact graph body on CPU to check packing independently of CUDA.
+    bank_graph = module.LateStageGraph(stages, 3, 128, False)
+    bank_graph.slots[:2].copy_(torch.tensor(slots))
+    bank_graph.lengths[:2].copy_(torch.tensor(lengths))
+    starts = [n + 1 for n in lengths]
+    bank_graph.starts[:2].copy_(torch.tensor(starts))
+    expected_bank = stages.prepare_bank_batch(slots, lengths, starts)
+    actual_bank = bank_graph.forward()
+    torch.testing.assert_close(actual_bank[:2], expected_bank, atol=3e-6, rtol=3e-6)
+    finish_graph = module.LateStageGraph(stages, 3, 128, True)
+    finish_graph.slots.copy_(bank_graph.slots)
+    finish_graph.lengths.copy_(bank_graph.lengths)
+    finish_graph.starts.copy_(bank_graph.starts)
+    finish_graph.banks.copy_(actual_bank)
+    finish_graph.bonus.normal_()
+    expected = stages.finish_batch(
+        slots, lengths, expected_bank, starts, finish_graph.bonus[:2]
+    )
+    actual = finish_graph.forward()
+    torch.testing.assert_close(actual[:2], expected, atol=3e-6, rtol=3e-6)
+    # Unused rows must not affect active rows even with very different values.
+    finish_graph.banks[2].fill_(1000)
+    finish_graph.bonus[2].fill_(-1000)
+    torch.testing.assert_close(finish_graph.forward()[:2], actual[:2])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bank_size", [12, 13])
+@torch.inference_mode()
+def test_stage_graph_replay_tracks_lengths_slots_and_preserves_outputs(bank_size):
+    _, stages = pair(torch.bfloat16, "cuda", bank_size)
+    stages.append_context_batch(
+        [0, 1],
+        [0, 0],
+        torch.randn(80, 32, device="cuda", dtype=torch.bfloat16),
+        [40, 40],
+    )
+    stages.capture_graphs()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        first = stages.prepare_bank_batch([1, 0], [5, 31], [7, 33])
+        saved = first.clone()
+        # Replaying the same graph must not mutate a previously returned bank.
+        second = stages.prepare_bank_batch([0, 1], [32, 6], [33, 7])
+    torch.cuda.current_stream().wait_stream(stream)
+    first.record_stream(torch.cuda.current_stream())
+    second.record_stream(torch.cuda.current_stream())
+    saved.record_stream(torch.cuda.current_stream())
+    torch.testing.assert_close(first, saved)
+    for accepted in range(8):
+        lengths = [6 + accepted, 32]
+        banks, starts = first, [7, 33]
+        if bank_size == 12 and accepted == 7:
+            banks = torch.cat((stages.prepare_bank_batch([1], [13], [14]), first[1:]))
+            starts = [14, 33]
+        bonus = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
+        actual = stages.finish_batch([1, 0], lengths, banks, starts, bonus)
+        graphs, stages.graphs = stages.graphs, {}
+        expected = stages.finish_batch([1, 0], lengths, banks, starts, bonus)
+        stages.graphs = graphs
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("bank_size", [12, 13])
+@pytest.mark.parametrize("accepted", range(8))
+@torch.inference_mode()
+def test_graph_finish_preserves_all_acceptance_boundaries(bank_size, accepted):
+    _, stages = pair(bank_size=bank_size)
+    stages.append_context(1, 0, torch.randn(40, 32))
+    length, start = 6 + accepted, 7
+    bank = stages.prepare_bank_batch([1], [5], [start])
+    if bank_size == 12 and accepted == 7:
+        start = length + 1
+        bank = stages.prepare_bank_batch([1], [length], [start])
+    bonus = torch.randn(1, 16)
+    expected = stages.finish_batch([1], [length], bank, [start], bonus)
+    graph = module.LateStageGraph(stages, 2, 128, True)
+    graph.slots[0] = 1
+    graph.lengths[0] = length
+    graph.starts[0] = start
+    graph.banks[:1].copy_(bank)
+    graph.bonus[:1].copy_(bonus)
+    torch.testing.assert_close(graph.forward()[:1], expected, atol=3e-6, rtol=3e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [7, 12, 13])
+@torch.inference_mode()
+def test_graph_packer_writes_only_valid_kv_with_strided_values(width):
+    from vllm.model_executor.models.dspark_late_kernels import pack_kv
+
+    cache = torch.randn(2, 4, 640, 2, 8, device="cuda", dtype=torch.bfloat16)
+    # Values are a strided view of QKV in production.
+    qkv = torch.randn(3 * width, 48, device="cuda", dtype=torch.bfloat16)
+    k, v = qkv[:, 16:32].reshape(-1, 2, 8), qkv[:, 32:].reshape(-1, 2, 8)
+    slots = torch.tensor([3, 1, 0], device="cuda")
+    lengths = torch.tensor([513, 64, 0], device="cuda")
+    cu_k = torch.empty(4, device="cuda", dtype=torch.int32)
+    out_k = torch.empty(3 * (2048 + width), 2, 8, device="cuda", dtype=torch.bfloat16)
+    out_v = torch.empty_like(out_k)
+
+    def metadata(values):
+        lengths.copy_(torch.tensor(values, device="cuda"))
+        cu_k[0] = 0
+        cu_k[1:].copy_((lengths + width).cumsum(0))
+
+    def pack():
+        pack_kv(
+            cache[0], cache[1], k, v, slots, lengths, cu_k, out_k, out_v, width, 2048
+        )
+
+    metadata([513, 64, 0])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        pack()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        pack()
+    stream.synchronize()
+    for values in ([513, 64, 0], [0, 1, 0], [3, 0, 512]):
+        metadata(values)
+        out_k.fill_(123)
+        out_v.fill_(-123)
+        graph.replay()
+        for output, source, query, sentinel in (
+            (out_k, cache[0], k, 123),
+            (out_v, cache[1], v, -123),
+        ):
+            expected = torch.cat(
+                [
+                    torch.cat(
+                        (source[slot, :length], query[i * width : (i + 1) * width])
+                    )
+                    for i, (slot, length) in enumerate(zip([3, 1, 0], values))
+                ]
+            )
+            torch.testing.assert_close(
+                output[: expected.shape[0]], expected, atol=0, rtol=0
+            )
+            assert (output[expected.shape[0] :] == sentinel).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bank_size", [12, 13])
+@torch.inference_mode()
+def test_bank_graph_matches_eager_across_capacity_buckets(bank_size):
+    _, stages = pair(torch.bfloat16, "cuda", bank_size, max_length=640)
+    stages.append_context_batch(
+        [0, 1],
+        [0, 0],
+        torch.randn(1280, 32, device="cuda", dtype=torch.bfloat16),
+        [640, 640],
+    )
+    cases = [([1, 0], [5, 31]), ([0, 1], [513, 64]), ([1], [129]), ([1, 0], [5, 31])]
+    expected = [
+        stages.prepare_bank_batch(slots, lengths, [n + 2 for n in lengths])
+        for slots, lengths in cases
+    ]
+    stages.capture_graphs()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    actual = []
+    with torch.cuda.stream(stream):
+        for slots, lengths in cases:
+            actual.append(
+                stages.prepare_bank_batch(slots, lengths, [n + 2 for n in lengths])
+            )
+    # Target-like work on the main stream while bank graphs are queued.
+    matrix = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    torch.mm(matrix, matrix)
+    torch.cuda.current_stream().wait_stream(stream)
+    for result, reference in zip(actual, expected):
+        result.record_stream(torch.cuda.current_stream())
+        torch.testing.assert_close(result, reference, atol=3e-2, rtol=3e-2)

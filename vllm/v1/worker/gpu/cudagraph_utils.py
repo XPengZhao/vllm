@@ -968,6 +968,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             # release the throwaway pool here rather than after the real init.
             for name in spec_manager_names:
                 setattr(speculator, name, None)
+            if speculator is not None and hasattr(speculator, "clear_cudagraphs"):
+                speculator.clear_cudagraphs()
             # Drop local references before teardown detaches the runner's
             # manager and flushes the allocator.
             del manager

@@ -39,6 +39,7 @@ def packed_rows(lengths, device):
 
 class LateConditioningStages:
     def __init__(self, model, max_requests, max_length, device, dtype):
+        self.graphs = {}
         self.model = model
         self.backbone = model.model
         config = model.config
@@ -88,6 +89,32 @@ class LateConditioningStages:
             device=device,
             dtype=dtype,
         )
+
+    def select_graph(self, batch, length, finish):
+        if not self.graphs:
+            return None
+        batch = next(n for n in self.graph_batches if n >= batch)
+        capacity = next(n for n in self.graph_lengths if n >= length)
+        return self.graphs[finish, batch, capacity]
+
+    def capture_graphs(self):
+        if self.graphs:
+            return
+        self.graph_batches = graph_buckets(self.kv.shape[2])
+        self.graph_lengths = graph_buckets(self.max_length, first=128, factor=4)
+        stream = torch.cuda.Stream(device=self.kv.device)
+        stream.wait_stream(torch.cuda.current_stream(self.kv.device))
+        # Separate pools are essential: bank can run concurrently with target
+        # and finish. Captures sharing a pool are only replayed serially.
+        for finish in (False, True):
+            pool = torch.cuda.graph_pool_handle()
+            for batch in reversed(self.graph_batches):
+                for capacity in reversed(self.graph_lengths):
+                    graph = LateStageGraph(self, batch, capacity, finish)
+                    stream.wait_stream(torch.cuda.current_stream(self.kv.device))
+                    graph.capture(pool, stream)
+                    self.graphs[finish, batch, capacity] = graph
+        stream.synchronize()
 
     def rope(self, x, positions):
         angles = positions.float()[:, None] * self.inv_freq[None, :]
@@ -159,10 +186,44 @@ class LateConditioningStages:
         total = sum(lengths) + len(lengths) * width
         packed_k = k.new_empty(total, self.n_kv_heads, self.head_dim)
         packed_v = torch.empty_like(packed_k)
-        packed_k[ctx_dst] = self.kv[index, 0, rows, local]
-        packed_v[ctx_dst] = self.kv[index, 1, rows, local]
-        packed_k[query_dst] = k
-        packed_v[query_dst] = v.view(-1, self.n_kv_heads, self.head_dim)
+        v = v.view(-1, self.n_kv_heads, self.head_dim)
+        if ctx_dst is None:
+            # Graph layout stores per-request slots/lengths, not capacity-sized
+            # gather indices. The packer never reads or writes unused capacity.
+            if k.is_cuda:
+                from vllm.model_executor.models.dspark_late_kernels import pack_kv
+
+                pack_kv(
+                    self.kv[index, 0],
+                    self.kv[index, 1],
+                    k,
+                    v,
+                    rows,
+                    local,
+                    cu_k,
+                    packed_k,
+                    packed_v,
+                    width,
+                    max(lengths),
+                )
+            else:
+                # CPU reference for the same valid-only packing contract.
+                for i, (slot, length, start) in enumerate(
+                    zip(rows.tolist(), local.tolist(), cu_k.tolist())
+                ):
+                    packed_k[start : start + length] = self.kv[index, 0, slot, :length]
+                    packed_v[start : start + length] = self.kv[index, 1, slot, :length]
+                    packed_k[start + length : start + length + width] = k[
+                        i * width : (i + 1) * width
+                    ]
+                    packed_v[start + length : start + length + width] = v[
+                        i * width : (i + 1) * width
+                    ]
+        else:
+            packed_k[ctx_dst] = self.kv[index, 0, rows, local]
+            packed_v[ctx_dst] = self.kv[index, 1, rows, local]
+            packed_k[query_dst] = k
+            packed_v[query_dst] = v
         # Context is read-only; temporary bank K/V never enter the cache.
         if self.varlen_attention is not None:
             y = self.varlen_attention(
@@ -177,9 +238,9 @@ class LateConditioningStages:
             )
         else:
             # CPU reference for tests; CUDA always uses one varlen call.
-            outputs, start = [], 0
-            for i, length in enumerate(lengths):
-                end = start + length + width
+            outputs = []
+            boundaries = cu_k.tolist()
+            for i, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
                 outputs.append(
                     F.scaled_dot_product_attention(
                         q[i * width : (i + 1) * width].transpose(0, 1).unsqueeze(0),
@@ -191,7 +252,6 @@ class LateConditioningStages:
                     .squeeze(0)
                     .transpose(0, 1)
                 )
-                start = end
             y = torch.cat(outputs)
         y = y.reshape(states.shape[0], -1)
         x = residual + F.linear(y, attn.o_proj.weight)
@@ -204,6 +264,9 @@ class LateConditioningStages:
         return self.prepare_bank_batch([slot], [length], [bank_start])[0]
 
     def prepare_bank_batch(self, slots, lengths, bank_starts):
+        graph = self.select_graph(len(slots), max(lengths), False)
+        if graph is not None:
+            return graph.replay(slots, lengths, bank_starts)
         states = self.backbone.future_mask.expand(len(slots) * self.bank_size, -1)
         positions = (
             device_ints(bank_starts, states.device)[:, None]
@@ -227,6 +290,9 @@ class LateConditioningStages:
         offsets = [length + 1 - start for length, start in zip(lengths, bank_starts)]
         if any(not 0 <= offset <= banks.shape[1] - 6 for offset in offsets):
             raise ValueError("4+1 bank does not cover this acceptance boundary")
+        graph = self.select_graph(len(slots), max(lengths), True)
+        if graph is not None:
+            return graph.replay(slots, lengths, bank_starts, banks, bonus_embeddings)
         indices = device_ints(offsets, banks.device)[:, None] + torch.arange(
             6, device=banks.device
         )
@@ -241,3 +307,136 @@ class LateConditioningStages:
             4, states, positions, self.batch_layout(slots, lengths, 7)
         )
         return rms_norm(states, self.backbone.norm).view(len(slots), 7, -1)
+
+
+def graph_buckets(limit, first=1, factor=2):
+    sizes = []
+    size = first
+    while size < limit:
+        sizes.append(size)
+        size *= factor
+    return [*sizes, limit]
+
+
+class LateStageGraph:
+    """One bounded shape; only metadata changes between replays.
+
+    Bank and finish use different pools. Outputs are copied out before another
+    replay can overwrite the pool, including a legacy full-acceptance rebuild.
+    """
+
+    def __init__(self, stages, batch, context_capacity, finish):
+        self.stages = stages
+        self.batch = batch
+        self.capacity = context_capacity
+        self.finish = finish
+        device, dtype = stages.kv.device, stages.kv.dtype
+        self.slots = torch.zeros(batch, device=device, dtype=torch.long)
+        self.lengths = torch.zeros_like(self.slots)
+        self.starts = torch.ones_like(self.slots)
+        self.banks = (
+            torch.zeros(
+                batch, stages.bank_size, stages.hidden, device=device, dtype=dtype
+            )
+            if finish
+            else None
+        )
+        self.bonus = (
+            torch.zeros(batch, stages.hidden, device=device, dtype=dtype)
+            if finish
+            else None
+        )
+
+    def forward(self):
+        stages = self.stages
+        batch, width = self.batch, 7 if self.finish else stages.bank_size
+        device = self.slots.device
+        context_offsets = torch.cat((self.lengths.new_zeros(1), self.lengths.cumsum(0)))
+        cu_q = torch.arange(batch + 1, device=device, dtype=torch.int32) * width
+        cu_k = context_offsets.to(torch.int32) + cu_q
+        layout = (
+            self.slots,
+            self.lengths,
+            None,
+            None,
+            cu_q,
+            cu_k,
+            [self.capacity] * batch,
+            width,
+        )
+        if self.finish:
+            assert self.banks is not None and self.bonus is not None
+            offsets = self.lengths + 1 - self.starts
+            indices = offsets[:, None] + torch.arange(6, device=device)
+            selected = self.banks.gather(
+                1, indices[..., None].expand(-1, -1, stages.hidden)
+            )
+            anchor = F.linear(self.bonus, stages.backbone.anchor_adapter.weight)
+            states = torch.cat((anchor[:, None], selected), 1).flatten(0, 1)
+            positions = (
+                self.lengths[:, None] + torch.arange(7, device=device)
+            ).flatten()
+            states = stages.layer_batch(4, states, positions, layout)
+            return rms_norm(states, stages.backbone.norm).view(batch, 7, -1)
+        states = stages.backbone.future_mask.expand(batch * width, -1)
+        positions = (
+            self.starts[:, None] + torch.arange(width, device=device)
+        ).flatten()
+        for index in range(4):
+            states = stages.layer_batch(index, states, positions, layout)
+        return states.view(batch, width, -1)
+
+    def capture(self, pool, stream):
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self.forward()
+        stream.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=pool, stream=stream):
+            self.output = self.forward()
+
+    def replay(self, slots, lengths, starts, banks=None, bonus=None):
+        count = len(slots)
+        self.slots.copy_(
+            device_ints([*slots, *([0] * (self.batch - count))], self.slots.device)
+        )
+        self.lengths.copy_(
+            device_ints([*lengths, *([0] * (self.batch - count))], self.slots.device)
+        )
+        self.starts.copy_(
+            device_ints([*starts, *([1] * (self.batch - count))], self.slots.device)
+        )
+        if self.finish:
+            assert self.banks is not None and self.bonus is not None
+            self.banks[:count].copy_(banks)
+            self.bonus[:count].copy_(bonus)
+        self.graph.replay()
+        return self.output[:count].clone()
+
+
+class LateSamplingGraph:
+    """Capture the vocabulary head and seven Markov sampling steps together."""
+
+    def __init__(self, sample, batch, hidden_size, device, dtype, pool, stream):
+        self.hidden = torch.zeros(batch, 7, hidden_size, device=device, dtype=dtype)
+        self.mapping = torch.full((batch,), -1, device=device, dtype=torch.int32)
+        self.lengths = torch.zeros(batch, device=device, dtype=torch.long)
+        self.bonus = torch.zeros_like(self.lengths)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                sample(self.hidden, self.mapping, self.lengths, self.bonus)
+        stream.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=pool, stream=stream):
+            self.output = sample(self.hidden, self.mapping, self.lengths, self.bonus)
+
+    def replay(self, hidden, mapping, lengths, bonus):
+        count = hidden.shape[0]
+        self.hidden[:count].copy_(hidden)
+        self.mapping.fill_(-1)
+        self.mapping[:count].copy_(mapping)
+        self.lengths[:count].copy_(lengths)
+        self.bonus[:count].copy_(bonus)
+        self.graph.replay()
+        return self.output[:count].clone()

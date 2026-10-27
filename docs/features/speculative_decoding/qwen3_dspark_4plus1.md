@@ -62,16 +62,33 @@ For an existing legacy export, change only the draft `model` path above, for
 example to `$HOME/models/qwen3-4b/dspark-4plus1-20261022-175740-step2616`.
 Keep `num_speculative_tokens: 7`. The startup log reports `bank12` or `bank13`.
 
-The draft batches projections and FFNs across requests and packs variable-length
-context K/V for FlashAttention, without padding to the longest request. Each of
-the seven Markov sampling steps processes the active batch together. Request
-bookkeeping stays on the CPU; draft CUDA graph capture is not yet implemented.
-Target CUDA graphs remain supported. The draft uses a private bounded context
-K/V pool. The pool is reserved at model
-load and included in memory profiling; it costs about 1.25 GiB at 8 requests
-and 8192 tokens for Qwen3-4B BF16. Set `--max-num-seqs` and `--max-model-len`
-explicitly: large defaults can reserve excessive memory. Temporary bank K/V
-never enter the persistent context cache.
+The draft batches projections and FFNs across requests and uses variable-length
+FlashAttention. With CUDA graphs enabled, startup captures the four-layer bank,
+the final layer, and the vocabulary head plus seven Markov sampling steps.
+Request counts use power-of-two buckets; context capacities use 128, 512, 2048,
+and so on, capped at `--max-model-len`. The packed buffers have bucket capacity,
+but a bounded Triton packing kernel copies only actual context and self K/V.
+Unused capacity is neither gathered nor written, and attention reads only the
+actual per-request lengths. Padding cannot enter
+another request's attention or sampling cache.
+
+Bank, final-layer, and sampling graphs have separate memory pools. Bank replay
+stays on the background stream, and graph outputs are copied before reuse,
+including legacy full-acceptance rebuilds. There is no runtime graph capture.
+Request bookkeeping, accepted-context K/V updates and metadata transfers remain
+eager; resolving acceptance counts still performs one CPU read per round.
+
+No new launch flag is required. Keep target CUDA graphs enabled and omit
+`--enforce-eager`. To compare against eager drafting while retaining target
+graphs, set `"enforce_eager": true` in `--speculative-config`. The startup log
+reports the captured stage and sampling graph counts. Profiling captures are
+released before the real startup capture.
+
+The private context K/V pool is reserved at model load; it costs about 1.25 GiB
+at 8 requests and 8192 tokens for Qwen3-4B BF16. Graph pools require additional
+memory and are included in CUDA graph memory profiling. Set `--max-num-seqs`
+and `--max-model-len` explicitly: large defaults reserve excessive memory.
+Temporary bank K/V never enter the persistent context cache.
 
 ## Dependency and position contract
 

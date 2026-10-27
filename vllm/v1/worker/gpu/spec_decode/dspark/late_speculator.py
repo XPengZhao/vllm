@@ -8,7 +8,11 @@ from dataclasses import dataclass
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.models.dspark_late import LateConditioningStages, device_ints
+from vllm.model_executor.models.dspark_late import (
+    LateConditioningStages,
+    LateSamplingGraph,
+    device_ints,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -113,6 +117,8 @@ class LateDSparkSpeculator(DraftModelSpeculator):
         self._draft_scatter_buf = None
         self.num_query_per_req = 7
         self.pending_jobs = []
+        self.sampling_graphs = {}
+        self.graph_enabled = False
 
     def load_draft_model(self, target_model, target_attn_layer_names):
         model = load_dspark_model(target_model, self.vllm_config)
@@ -138,10 +144,53 @@ class LateDSparkSpeculator(DraftModelSpeculator):
         pass  # Packed attention does not need paged-attention metadata.
 
     def init_cudagraph_manager(self, cudagraph_mode):
-        pass  # Target CUDA graphs are supported; the two draft stages are eager.
+        self.graph_enabled = (
+            cudagraph_mode.name != "NONE"
+            and not self.draft_model_config.enforce_eager
+            and not self.speculative_config.enforce_eager
+        )
 
+    @torch.inference_mode()
     def capture(self):
-        pass
+        if not self.graph_enabled or self.sampling_graphs:
+            return
+        self.stages.capture_graphs()
+        pool = torch.cuda.graph_pool_handle()
+        stream = torch.cuda.Stream(device=self.device)
+        for batch in reversed(self.stages.graph_batches):
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            self.sampling_graphs[batch] = LateSamplingGraph(
+                self._sample_hidden,
+                batch,
+                self.hidden_size,
+                self.device,
+                self.dtype,
+                pool,
+                stream,
+            )
+        stream.synchronize()
+        logger.info(
+            "DSpark 4+1 captured %d stage graphs and %d sampling graphs",
+            len(self.stages.graphs),
+            len(self.sampling_graphs),
+        )
+
+    def clear_cudagraphs(self):
+        self.sampling_graphs.clear()
+        self.stages.graphs.clear()
+
+    def _sample_hidden(self, hidden, mapping, positions, bonus):
+        logits = self.model.compute_draft_logits(hidden.flatten(0, 1)).view(
+            hidden.shape[0], 7, -1
+        )
+        prev, tokens = bonus, []
+        for step in range(7):
+            corrected = logits[:, step] + self.model.markov_bias(
+                self.model.markov_embed(prev)
+            )
+            prev = self._sample_logits(corrected, mapping, positions + step + 1, step)
+            tokens.append(prev)
+        return torch.stack(tokens, dim=1)
 
     def remove_request(self, req_id):
         state = self.contexts.pop(req_id, None)
@@ -321,19 +370,14 @@ class LateDSparkSpeculator(DraftModelSpeculator):
                 [s.bank_start for _, s in active],
                 self.model.model.embed_tokens(bonus),
             )
-            logits = self.model.compute_draft_logits(hidden.flatten(0, 1)).view(
-                len(active), 7, -1
-            )
-            prev = bonus
             positions = device_ints(lengths, self.device)
-            for step in range(7):
-                corrected = logits[:, step] + self.model.markov_bias(
-                    self.model.markov_embed(prev)
-                )
-                prev = self._sample_logits(
-                    corrected, mapping, positions + step + 1, step
-                )
-                output[batch_rows, step] = prev
+            graphs = self.sampling_graphs
+            if graphs:
+                bucket = next(n for n in self.stages.graph_batches if n >= len(active))
+                tokens = graphs[bucket].replay(hidden, mapping, positions, bonus)
+            else:
+                tokens = self._sample_hidden(hidden, mapping, positions, bonus)
+            output[batch_rows] = tokens
         for _, state in active:
             state.bank = state.ready = None
         return output

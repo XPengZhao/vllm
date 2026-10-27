@@ -146,6 +146,7 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
     runtime = cls.__new__(cls)
     runtime.contexts = {}
     runtime.pending_jobs = []
+    runtime.sampling_graphs = {}
     runtime.device = "cpu"
     runtime.stream = Stream()
     runtime.overlap = overlap
@@ -308,8 +309,9 @@ def test_chunked_prefill_does_not_prepare_a_delayed_bank(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("use_graph", [False, True])
 @torch.inference_mode()
-def test_runtime_bank_has_measured_gpu_overlap_with_verifier_work():
+def test_runtime_bank_has_measured_gpu_overlap_with_verifier_work(use_graph):
     """Measure device intervals, not just the presence of a second stream."""
     helper_spec = importlib.util.spec_from_file_location(
         "stage_gpu_tests", Path(__file__).with_name("test_dspark_late.py")
@@ -321,6 +323,8 @@ def test_runtime_bank_has_measured_gpu_overlap_with_verifier_work():
     features = torch.randn(5, 32, device="cuda", dtype=torch.bfloat16)
     stages.append_context(0, 0, features)
     expected = stages.prepare_bank(0, 5, 7)
+    if use_graph:
+        stages.capture_graphs()
     cls = runtime_class()
     runtime = cls.__new__(cls)
     runtime.contexts = {"a": SimpleNamespace(slot=0, length=5, bank=None, ready=None)}
@@ -359,3 +363,86 @@ def test_runtime_bank_has_measured_gpu_overlap_with_verifier_work():
     ) - max(origin.elapsed_time(target_start), origin.elapsed_time(bank_start))
     assert overlap_ms > 0, f"no measured device overlap: {overlap_ms}ms"
     torch.testing.assert_close(runtime.contexts["a"].bank, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("probabilistic", [False, True])
+@torch.inference_mode()
+def test_sampling_graph_matches_per_request_tokens_and_cache(probabilistic):
+    from vllm.model_executor.models.dspark_late import LateSamplingGraph
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    cls = runtime_class()
+    runtime = cls.__new__(cls)
+    runtime._sample_logits = DSparkSpeculator._sample_logits.__get__(runtime)
+    runtime._maybe_predict_acceptance = lambda *args: None
+    runtime._step_cols = torch.arange(7, device="cuda", dtype=torch.int32)
+    runtime._d2t_scatter_index = None
+    runtime.draft_watermarker = None
+    runtime.use_fp64_gumbel = False
+    runtime.temperature = torch.tensor([0.0, 0.7, 0.0, 1.0, 0.0], device="cuda")
+    runtime.seeds = torch.tensor([10, 22, 30, 44, 50], device="cuda")
+    runtime.draft_logits = (
+        torch.full((5, 7, 32), -123.0, device="cuda") if probabilistic else None
+    )
+    runtime.model = SimpleNamespace(
+        compute_draft_logits=nn.Linear(16, 32, bias=False).cuda(),
+        markov_embed=nn.Embedding(32, 8).cuda(),
+        markov_bias=nn.Linear(8, 32, bias=False).cuda(),
+        map_draft_to_target=lambda ids: ids,
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = LateSamplingGraph(
+        runtime._sample_hidden,
+        4,
+        16,
+        "cuda",
+        torch.float32,
+        torch.cuda.graph_pool_handle(),
+        stream,
+    )
+    stream.synchronize()
+    for slots in ([3, 1], [1, 3], [3]):
+        count = len(slots)
+        mapping = torch.tensor(slots, device="cuda", dtype=torch.int32)
+        positions = torch.arange(count, device="cuda") + 17
+        bonus = torch.arange(count, device="cuda") + 2
+        hidden = torch.randn(count, 7, 16, device="cuda")
+        if probabilistic:
+            runtime.draft_logits.fill_(-123.0)
+        expected = torch.cat(
+            [
+                runtime._sample_hidden(
+                    hidden[i : i + 1],
+                    mapping[i : i + 1],
+                    positions[i : i + 1],
+                    bonus[i : i + 1],
+                )
+                for i in range(count)
+            ]
+        )
+        cached = runtime.draft_logits.clone() if probabilistic else None
+        if probabilistic:
+            runtime.draft_logits.fill_(-123.0)
+        actual = graph.replay(hidden, mapping, positions, bonus)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        if probabilistic:
+            torch.testing.assert_close(
+                runtime.draft_logits, cached, atol=1e-5, rtol=1e-5
+            )
+
+
+@pytest.mark.parametrize("mode", ["NONE", "FULL_AND_PIECEWISE"])
+@pytest.mark.parametrize("draft_eager", [False, True])
+def test_graph_configuration_and_profiling_cleanup(mode, draft_eager):
+    cls = runtime_class()
+    runtime = cls.__new__(cls)
+    runtime.draft_model_config = SimpleNamespace(enforce_eager=False)
+    runtime.speculative_config = SimpleNamespace(enforce_eager=draft_eager)
+    runtime.init_cudagraph_manager(SimpleNamespace(name=mode))
+    assert runtime.graph_enabled == (mode != "NONE" and not draft_eager)
+    runtime.sampling_graphs = {1: object()}
+    runtime.stages = SimpleNamespace(graphs={(False, 1, 128): object()})
+    runtime.clear_cudagraphs()
+    assert not runtime.sampling_graphs and not runtime.stages.graphs
