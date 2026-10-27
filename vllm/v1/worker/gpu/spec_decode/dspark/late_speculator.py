@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Seven-token 4+1 drafting with bank execution on a separate CUDA stream."""
+"""Variable-length 4+1 drafting with bank execution on a separate CUDA stream."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -68,11 +68,13 @@ def validate_late_config(config):
     if config.cache_config.enable_prefix_caching:
         raise ValueError("4+1 requires --no-enable-prefix-caching")
     if (
-        spec.num_speculative_tokens != 7
+        not 1 <= spec.num_speculative_tokens <= hf.block_size
         or spec.enable_adaptive_verification
         or spec.num_speculative_tokens_per_batch_size is not None
     ):
-        raise ValueError("4+1 requires fixed seven-token proposals")
+        raise ValueError(
+            "4+1 requires a fixed proposal length between 1 and block_size (7)"
+        )
     if config.model_config.quantization or spec.quantization:
         raise ValueError("4+1 requires unquantized target and draft weights")
     if config.lora_config is not None or config.model_config.supports_multimodal_inputs:
@@ -112,10 +114,12 @@ class LateDSparkSpeculator(DraftModelSpeculator):
             raise ValueError("late_conditioning.overlap must be a boolean")
         self.stream = torch.cuda.Stream(device=device)
         self.contexts: dict[str, RequestContext] = {}
-        self._step_cols = torch.arange(7, dtype=torch.int32, device=device)
+        self._step_cols = torch.arange(
+            self.num_speculative_steps, dtype=torch.int32, device=device
+        )
         self._d2t_scatter_index = None
         self._draft_scatter_buf = None
-        self.num_query_per_req = 7
+        self.num_query_per_req = self.num_speculative_steps
         self.pending_jobs = []
         self.sampling_graphs = {}
         self.graph_enabled = False
@@ -125,11 +129,17 @@ class LateDSparkSpeculator(DraftModelSpeculator):
         if model.draft_id_to_target_id is not None:
             raise ValueError("4+1 requires the full target vocabulary")
         self.stages = LateConditioningStages(
-            model, self.max_num_reqs, self.max_model_len, self.device, self.dtype
+            model,
+            self.max_num_reqs,
+            self.max_model_len,
+            self.device,
+            self.dtype,
+            num_speculative_tokens=self.num_speculative_steps,
         )
         logger.info(
-            "DSpark 4+1: bank%d, draft7, overlap=%s, reserved context K/V %.2f GiB",
+            "DSpark 4+1: bank%d, draft%d, overlap=%s, reserved context K/V %.2f GiB",
             self.stages.bank_size,
+            self.num_speculative_steps,
             self.overlap,
             self.stages.kv.numel() * self.stages.kv.element_size() / 2**30,
         )
@@ -167,6 +177,7 @@ class LateDSparkSpeculator(DraftModelSpeculator):
                 self.dtype,
                 pool,
                 stream,
+                num_speculative_tokens=self.num_speculative_steps,
             )
         stream.synchronize()
         logger.info(
@@ -181,10 +192,10 @@ class LateDSparkSpeculator(DraftModelSpeculator):
 
     def _sample_hidden(self, hidden, mapping, positions, bonus):
         logits = self.model.compute_draft_logits(hidden.flatten(0, 1)).view(
-            hidden.shape[0], 7, -1
+            hidden.shape[0], hidden.shape[1], -1
         )
         prev, tokens = bonus, []
-        for step in range(7):
+        for step in range(hidden.shape[1]):
             corrected = logits[:, step] + self.model.markov_bias(
                 self.model.markov_embed(prev)
             )

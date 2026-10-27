@@ -87,7 +87,14 @@ def test_configuration_accepts_both_bank_versions_and_rejects_unsafe_modes():
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         lora_config=None,
     )
-    validate(config)
+    for n in range(1, 8):
+        config.speculative_config.num_speculative_tokens = n
+        validate(config)
+    for n in (0, 8):
+        config.speculative_config.num_speculative_tokens = n
+        with pytest.raises(ValueError, match="proposal length"):
+            validate(config)
+    config.speculative_config.num_speculative_tokens = 7
     hf.dflash_config["late_conditioning"] = {"enabled": True}
     validate(config)
     hf.dflash_config["late_conditioning"].update(bank_size=12, max_context_lag=7)
@@ -106,11 +113,13 @@ def test_configuration_accepts_both_bank_versions_and_rejects_unsafe_modes():
 
 
 @pytest.mark.parametrize("bank_size", [12, 13])
-@pytest.mark.parametrize("accepted", range(8))
+@pytest.mark.parametrize(
+    "proposal_length,accepted", [(n, a) for n in (1, 6, 7) for a in range(n + 1)]
+)
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("cursor_upper_bound", [0, 7])
 def test_prefill_mixed_acceptance_reorder_and_request_reuse(
-    monkeypatch, bank_size, accepted, overlap, cursor_upper_bound
+    monkeypatch, bank_size, proposal_length, accepted, overlap, cursor_upper_bound
 ):
     helper_spec = importlib.util.spec_from_file_location(
         "stage_tests", Path(__file__).with_name("test_dspark_late.py")
@@ -118,7 +127,10 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
     assert helper_spec is not None and helper_spec.loader is not None
     helper = importlib.util.module_from_spec(helper_spec)
     helper_spec.loader.exec_module(helper)
-    ref, stages = helper.pair(bank_size=bank_size)
+    ref, stages = helper.pair(
+        bank_size=bank_size, num_speculative_tokens=proposal_length
+    )
+    ref.block_size = proposal_length
     actions = []
     prepared = []
     prepare_bank = stages.prepare_bank_batch
@@ -151,7 +163,7 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
     runtime.stream = Stream()
     runtime.overlap = overlap
     runtime.stages = stages
-    runtime.draft_tokens = torch.empty(2, 7, dtype=torch.long)
+    runtime.draft_tokens = torch.empty(2, proposal_length, dtype=torch.long)
     runtime._copy_request_inputs = lambda *a: None
 
     sampling_calls = []
@@ -212,7 +224,9 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
     first = batch(["a", "b"], [1, 0], [0, 0], [5, 7], [0, 0])
     context_a, context_b = torch.randn(5, 32), torch.randn(7, 32)
     propose(first, torch.cat((context_a, context_b)), [1, 1], [0, 0])
-    second = batch(["b", "a"], [0, 1], [7, 5], [8, 8], [7, 7])
+    second = batch(
+        ["b", "a"], [0, 1], [7, 5], [proposal_length + 1] * 2, [proposal_length] * 2
+    )
     runtime.begin_verification(second)
     prefix_event = runtime.prefix_ready
     assert all(s.bank is None for s in runtime.contexts.values())
@@ -225,11 +239,17 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
     assert actions[2] == ("wait", prefix_event)
     bank_a = runtime.contexts["a"].bank.clone()
     bank_b = runtime.contexts["b"].bank.clone()
-    fresh_b, fresh_a = torch.randn(8, 32), torch.randn(8, 32)
-    actual = propose(
-        second, torch.cat((fresh_b, fresh_a)), [accepted + 1, 1], [7 - accepted, 7]
+    fresh_b, fresh_a = (
+        torch.randn(proposal_length + 1, 32),
+        torch.randn(proposal_length + 1, 32),
     )
-    assert sampling_calls == [(2, step) for step in range(7)] * 2
+    actual = propose(
+        second,
+        torch.cat((fresh_b, fresh_a)),
+        [accepted + 1, 1],
+        [proposal_length - accepted, proposal_length],
+    )
+    assert sampling_calls == [(2, step) for step in range(proposal_length)] * 2
     assert runtime.contexts["b"].length == 8 + accepted
     assert runtime.contexts["a"].length == 6  # none accepted
     fallback = bank_size == 12 and accepted == 7
@@ -270,7 +290,7 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
         )
         expected.append(tokens[0])
     torch.testing.assert_close(actual, torch.stack(expected))
-    assert actual.shape == (2, 7)
+    assert actual.shape == (2, proposal_length)
     assert all(
         state.bank is None and state.ready is None
         for state in runtime.contexts.values()
@@ -367,8 +387,11 @@ def test_runtime_bank_has_measured_gpu_overlap_with_verifier_work(use_graph):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("probabilistic", [False, True])
+@pytest.mark.parametrize("proposal_length", [1, 6, 7])
 @torch.inference_mode()
-def test_sampling_graph_matches_per_request_tokens_and_cache(probabilistic):
+def test_sampling_graph_matches_per_request_tokens_and_cache(
+    probabilistic, proposal_length
+):
     from vllm.model_executor.models.dspark_late import LateSamplingGraph
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
@@ -376,14 +399,16 @@ def test_sampling_graph_matches_per_request_tokens_and_cache(probabilistic):
     runtime = cls.__new__(cls)
     runtime._sample_logits = DSparkSpeculator._sample_logits.__get__(runtime)
     runtime._maybe_predict_acceptance = lambda *args: None
-    runtime._step_cols = torch.arange(7, device="cuda", dtype=torch.int32)
+    runtime._step_cols = torch.arange(proposal_length, device="cuda", dtype=torch.int32)
     runtime._d2t_scatter_index = None
     runtime.draft_watermarker = None
     runtime.use_fp64_gumbel = False
     runtime.temperature = torch.tensor([0.0, 0.7, 0.0, 1.0, 0.0], device="cuda")
     runtime.seeds = torch.tensor([10, 22, 30, 44, 50], device="cuda")
     runtime.draft_logits = (
-        torch.full((5, 7, 32), -123.0, device="cuda") if probabilistic else None
+        torch.full((5, proposal_length, 32), -123.0, device="cuda")
+        if probabilistic
+        else None
     )
     runtime.model = SimpleNamespace(
         compute_draft_logits=nn.Linear(16, 32, bias=False).cuda(),
@@ -401,6 +426,7 @@ def test_sampling_graph_matches_per_request_tokens_and_cache(probabilistic):
         torch.float32,
         torch.cuda.graph_pool_handle(),
         stream,
+        num_speculative_tokens=proposal_length,
     )
     stream.synchronize()
     for slots in ([3, 1], [1, 3], [3]):
@@ -408,7 +434,7 @@ def test_sampling_graph_matches_per_request_tokens_and_cache(probabilistic):
         mapping = torch.tensor(slots, device="cuda", dtype=torch.int32)
         positions = torch.arange(count, device="cuda") + 17
         bonus = torch.arange(count, device="cuda") + 2
-        hidden = torch.randn(count, 7, 16, device="cuda")
+        hidden = torch.randn(count, proposal_length, 16, device="cuda")
         if probabilistic:
             runtime.draft_logits.fill_(-123.0)
         expected = torch.cat(

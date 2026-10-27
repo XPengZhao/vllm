@@ -10,9 +10,16 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 @pytest.mark.parametrize("draft_sample_method", ["greedy", "probabilistic"])
 @pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("proposal_length", [6, 7])
 @pytest.mark.parametrize("enforce_eager", [False, True])
 def test_late_engine_matches_target_and_reuses_request_slots(
-    tmp_path, vllm_runner, draft_sample_method, legacy, enforce_eager, monkeypatch
+    tmp_path,
+    vllm_runner,
+    draft_sample_method,
+    legacy,
+    enforce_eager,
+    proposal_length,
+    monkeypatch,
 ):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     from transformers import Qwen3Config, Qwen3ForCausalLM
@@ -77,7 +84,7 @@ def test_late_engine_matches_target_and_reuses_request_slots(
         speculative_config=dict(
             method="dspark",
             model=str(draft_dir),
-            num_speculative_tokens=7,
+            num_speculative_tokens=proposal_length,
             draft_sample_method=draft_sample_method,
         ),
     ) as runner:

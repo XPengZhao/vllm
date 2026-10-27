@@ -1,9 +1,9 @@
-# Qwen3-4B DSpark 4+1: seven proposals with concurrent bank execution
+# Qwen3-4B DrawSpec: configurable proposals with concurrent bank execution
 
 This branch supports dense 4+1 checkpoints trained with either SpecForge's
 v3 `4+1-bank13-draft7-uniform-lag0to8-v3` semantics or the earlier v2
-`4+1-shared-mask-uniform-lag0to7-v2` semantics. Both propose all seven trained
-outputs. Ordinary DSpark continues to use the existing speculator.
+`4+1-shared-mask-uniform-lag0to7-v2` semantics. The proposal length is selected at startup by `num_speculative_tokens`
+(1 through 7). Ordinary DSpark continues to use the existing speculator.
 
 Legacy exports containing only `"late_conditioning": {"enabled": true}` use
 a twelve-state bank and lag 0..7. They can be served directly without retraining
@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES=0 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /data1/models/Qwen3
 ```
 
 Supported scope: one GPU, unquantized text Qwen3 target/draft, vanilla Markov
-head, fixed seven-token proposals. Greedy and probabilistic drafting use the
+head, a fixed proposal length of 1 through 7 tokens. Greedy and probabilistic drafting use the
 existing DSpark sampler and standard vLLM rejection sampling. Adaptive
 verification, distributed parallelism, LoRA, watermarking and KV transfer are
 rejected. Requests can batch, finish, be preempted and reuse slots. Chunked
@@ -60,11 +60,19 @@ prefill is supported; its final chunk bootstraps from the complete prefix.
 
 For an existing legacy export, change only the draft `model` path above, for
 example to `$HOME/models/qwen3-4b/dspark-4plus1-20261022-175740-step2616`.
-Keep `num_speculative_tokens: 7`. The startup log reports `bank12` or `bank13`.
+Set `num_speculative_tokens: 6` to use `anchor + 5 states` in the final layer
+and propose six tokens. The 12-state bank is unchanged, and full acceptance no
+longer requires a synchronous bank rebuild. Sampling buffers and CUDA graphs
+use the configured proposal length. No checkpoint edits or retraining are
+required. The startup log reports both bank width and proposal length.
+
+Using fewer than seven positions changes final-layer bidirectional attention;
+it does not compute seven outputs and truncate them. The original seven-token
+behavior is retained with `num_speculative_tokens: 7`.
 
 The draft batches projections and FFNs across requests and uses variable-length
 FlashAttention. With CUDA graphs enabled, startup captures the four-layer bank,
-the final layer, and the vocabulary head plus seven Markov sampling steps.
+the final layer, and the vocabulary head plus the configured number of Markov sampling steps.
 Request counts use power-of-two buckets; context capacities use 128, 512, 2048,
 and so on, capped at `--max-model-len`. The packed buffers have bucket capacity,
 but a bounded Triton packing kernel copies only actual context and self K/V.
@@ -98,22 +106,19 @@ target forward. Once target kernels are enqueued, it launches the four-layer
 bank on a separate stream waiting only on that earlier event. This is not a
 `wait_stream(main)` after target forward, which would serialize the two.
 
-The bank contains thirteen pure MASK slots t+2..t+14 and never reads the new
-bonus or current-block target features. If r=0..7 proposals are accepted, the
-next anchor is b=t+r+1. The selected six states are bank[r:r+6], at b+1..b+6.
-The final stage waits for both verification and bank completion, appends only
-accepted target features, then computes [adapted bonus, six states] at b..b+6.
-All seven outputs predict b+1..b+7. The thirteen-state model needs no
-full-acceptance fallback. First-request prefill uses bank start b+1 with the
-full prompt prefix.
+The bank contains twelve or thirteen pure MASK slots starting at t+2 and
+never reads the new bonus or current-block target features. For proposal length
+N and r=0..N accepted proposals, the next anchor is b=t+r+1. The selected N-1
+states are bank[r:r+N-1], at b+1..b+N-1. The final stage computes
+[adapted bonus, N-1 states] and predicts N tokens at b+1..b+N. First-request
+prefill uses bank start b+1 with the full prompt prefix.
 
-Legacy banks cover t+2..t+13. When r=0..6, the six selected states are in range
-and the lag is 1..7, matching training. When r=7, the runner waits for the
-outstanding bank read, commits the eight verified context positions, and
-rebuilds a twelve-state bank at b+1 using that complete accepted prefix. This
-uses the legacy training's lag-zero bootstrap path and still produces seven
-tokens. It adds synchronous bank work on full-acceptance rounds; other rounds
-reuse the overlapped bank. Serial mode uses the same boundary policy.
+At N<=6, both bank versions cover every acceptance boundary without rebuilding.
+At N=7, a thirteen-state bank also covers every boundary. A legacy twelve-state
+bank must rebuild after r=7: the runner waits for its outstanding read, commits
+the eight verified context positions, and rebuilds at b+1 using the complete
+accepted prefix (the trained lag-zero bootstrap path). Other rounds reuse the
+background bank. Serial mode uses the same boundary policy.
 
 Target and draft stages have distinct context K/V and use no shared vLLM
 attention/workspace buffers. Request removal waits on outstanding bank reads

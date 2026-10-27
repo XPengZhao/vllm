@@ -38,7 +38,10 @@ def packed_rows(lengths, device):
 
 
 class LateConditioningStages:
-    def __init__(self, model, max_requests, max_length, device, dtype):
+    def __init__(
+        self, model, max_requests, max_length, device, dtype, num_speculative_tokens=7
+    ):
+        self.num_query_per_req = num_speculative_tokens
         self.graphs = {}
         self.model = model
         self.backbone = model.model
@@ -287,26 +290,27 @@ class LateConditioningStages:
         )[0]
 
     def finish_batch(self, slots, lengths, banks, bank_starts, bonus_embeddings):
+        width = self.num_query_per_req
         offsets = [length + 1 - start for length, start in zip(lengths, bank_starts)]
-        if any(not 0 <= offset <= banks.shape[1] - 6 for offset in offsets):
+        if any(not 0 <= offset <= banks.shape[1] - (width - 1) for offset in offsets):
             raise ValueError("4+1 bank does not cover this acceptance boundary")
         graph = self.select_graph(len(slots), max(lengths), True)
         if graph is not None:
             return graph.replay(slots, lengths, bank_starts, banks, bonus_embeddings)
         indices = device_ints(offsets, banks.device)[:, None] + torch.arange(
-            6, device=banks.device
+            width - 1, device=banks.device
         )
         selected = banks.gather(1, indices[..., None].expand(-1, -1, self.hidden))
         anchor = F.linear(bonus_embeddings, self.backbone.anchor_adapter.weight)
         states = torch.cat((anchor[:, None], selected), dim=1).flatten(0, 1)
         positions = (
             device_ints(lengths, banks.device)[:, None]
-            + torch.arange(7, device=banks.device)
+            + torch.arange(width, device=banks.device)
         ).flatten()
         states = self.layer_batch(
-            4, states, positions, self.batch_layout(slots, lengths, 7)
+            4, states, positions, self.batch_layout(slots, lengths, width)
         )
-        return rms_norm(states, self.backbone.norm).view(len(slots), 7, -1)
+        return rms_norm(states, self.backbone.norm).view(len(slots), width, -1)
 
 
 def graph_buckets(limit, first=1, factor=2):
@@ -349,7 +353,10 @@ class LateStageGraph:
 
     def forward(self):
         stages = self.stages
-        batch, width = self.batch, 7 if self.finish else stages.bank_size
+        batch, width = (
+            self.batch,
+            stages.num_query_per_req if self.finish else stages.bank_size,
+        )
         device = self.slots.device
         context_offsets = torch.cat((self.lengths.new_zeros(1), self.lengths.cumsum(0)))
         cu_q = torch.arange(batch + 1, device=device, dtype=torch.int32) * width
@@ -367,17 +374,17 @@ class LateStageGraph:
         if self.finish:
             assert self.banks is not None and self.bonus is not None
             offsets = self.lengths + 1 - self.starts
-            indices = offsets[:, None] + torch.arange(6, device=device)
+            indices = offsets[:, None] + torch.arange(width - 1, device=device)
             selected = self.banks.gather(
                 1, indices[..., None].expand(-1, -1, stages.hidden)
             )
             anchor = F.linear(self.bonus, stages.backbone.anchor_adapter.weight)
             states = torch.cat((anchor[:, None], selected), 1).flatten(0, 1)
             positions = (
-                self.lengths[:, None] + torch.arange(7, device=device)
+                self.lengths[:, None] + torch.arange(width, device=device)
             ).flatten()
             states = stages.layer_batch(4, states, positions, layout)
-            return rms_norm(states, stages.backbone.norm).view(batch, 7, -1)
+            return rms_norm(states, stages.backbone.norm).view(batch, width, -1)
         states = stages.backbone.future_mask.expand(batch * width, -1)
         positions = (
             self.starts[:, None] + torch.arange(width, device=device)
@@ -415,10 +422,22 @@ class LateStageGraph:
 
 
 class LateSamplingGraph:
-    """Capture the vocabulary head and seven Markov sampling steps together."""
+    """Capture the vocabulary head and configured Markov sampling steps."""
 
-    def __init__(self, sample, batch, hidden_size, device, dtype, pool, stream):
-        self.hidden = torch.zeros(batch, 7, hidden_size, device=device, dtype=dtype)
+    def __init__(
+        self,
+        sample,
+        batch,
+        hidden_size,
+        device,
+        dtype,
+        pool,
+        stream,
+        num_speculative_tokens=7,
+    ):
+        self.hidden = torch.zeros(
+            batch, num_speculative_tokens, hidden_size, device=device, dtype=dtype
+        )
         self.mapping = torch.full((batch,), -1, device=device, dtype=torch.int32)
         self.lengths = torch.zeros(batch, device=device, dtype=torch.long)
         self.bonus = torch.zeros_like(self.lengths)

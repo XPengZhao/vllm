@@ -24,7 +24,13 @@ spec.loader.exec_module(module)
 LateConditioningStages = module.LateConditioningStages
 
 
-def pair(dtype=torch.float32, device="cpu", bank_size=13, max_length=128):
+def pair(
+    dtype=torch.float32,
+    device="cpu",
+    bank_size=13,
+    max_length=128,
+    num_speculative_tokens=7,
+):
     reference_module = pytest.importorskip("specforge.modeling.draft.dspark")
     config = Qwen3Config(
         vocab_size=32,
@@ -93,7 +99,9 @@ def pair(dtype=torch.float32, device="cpu", bank_size=13, max_length=128):
     config.dflash_config["late_conditioning"] = dict(
         enabled=True, bank_size=bank_size, max_context_lag=bank_size - 5
     )
-    return reference, LateConditioningStages(serving, 2, max_length, device, dtype)
+    return reference, LateConditioningStages(
+        serving, 2, max_length, device, dtype, num_speculative_tokens
+    )
 
 
 def legacy_training_forward(ref, context, bonus, anchor, old):
@@ -319,9 +327,14 @@ def test_graph_packed_capacity_matches_eager_without_padding_leak(bank_size, len
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("bank_size", [12, 13])
+@pytest.mark.parametrize("proposal_length", [1, 6, 7])
 @torch.inference_mode()
-def test_stage_graph_replay_tracks_lengths_slots_and_preserves_outputs(bank_size):
-    _, stages = pair(torch.bfloat16, "cuda", bank_size)
+def test_stage_graph_replay_tracks_lengths_slots_and_preserves_outputs(
+    bank_size, proposal_length
+):
+    _, stages = pair(
+        torch.bfloat16, "cuda", bank_size, num_speculative_tokens=proposal_length
+    )
     stages.append_context_batch(
         [0, 1],
         [0, 0],
@@ -341,7 +354,7 @@ def test_stage_graph_replay_tracks_lengths_slots_and_preserves_outputs(bank_size
     second.record_stream(torch.cuda.current_stream())
     saved.record_stream(torch.cuda.current_stream())
     torch.testing.assert_close(first, saved)
-    for accepted in range(8):
+    for accepted in range(proposal_length + 1):
         lengths = [6 + accepted, 32]
         banks, starts = first, [7, 33]
         if bank_size == 12 and accepted == 7:
@@ -378,7 +391,7 @@ def test_graph_finish_preserves_all_acceptance_boundaries(bank_size, accepted):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("width", [7, 12, 13])
+@pytest.mark.parametrize("width", [1, 6, 7, 12, 13])
 @torch.inference_mode()
 def test_graph_packer_writes_only_valid_kv_with_strided_values(width):
     from vllm.model_executor.models.dspark_late_kernels import pack_kv
@@ -468,3 +481,50 @@ def test_bank_graph_matches_eager_across_capacity_buckets(bank_size):
     for result, reference in zip(actual, expected):
         result.record_stream(torch.cuda.current_stream())
         torch.testing.assert_close(result, reference, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("bank_size", [12, 13])
+@pytest.mark.parametrize("proposal_length", range(1, 8))
+@pytest.mark.parametrize("all_accepted", [False, True])
+@torch.inference_mode()
+def test_variable_final_block_matches_reference_and_graph(
+    bank_size, proposal_length, all_accepted
+):
+    from specforge.modeling.draft.dspark_late import finish_block
+
+    ref, stages = pair(bank_size=bank_size, num_speculative_tokens=proposal_length)
+    context = torch.randn(1, 24, 32)
+    old, start = 5, 7
+    anchor = old + 1 + (proposal_length if all_accepted else 0)
+    stages.append_context(1, 0, context[0, :anchor])
+    bank = stages.prepare_bank_batch([1], [old], [start])
+    assert bank.shape == (1, bank_size, 16)
+    # Proposal length must never change the bidirectional bank computation.
+    stages.num_query_per_req = 7
+    torch.testing.assert_close(bank, stages.prepare_bank_batch([1], [old], [start]))
+    stages.num_query_per_req = proposal_length
+    if bank_size == 12 and anchor - old > 7:
+        start = anchor + 1
+        bank = stages.prepare_bank_batch([1], [anchor], [start])
+    bonus = torch.randn(1, 16)
+    # Shorten only the reference final attention block, retaining the full bank.
+    ref.block_size = proposal_length
+    expected = finish_block(
+        ref,
+        bank[:, None],
+        context,
+        bonus[:, None],
+        torch.tensor([[anchor]]),
+        torch.tensor([[start]]),
+        torch.ones(1, 1, dtype=torch.bool),
+    )
+    actual = stages.finish_batch([1], [anchor], bank, [start], bonus)
+    assert actual.shape == (1, proposal_length, 16)
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-6)
+    graph = module.LateStageGraph(stages, 2, 128, True)
+    graph.slots[0] = 1
+    graph.lengths[0] = anchor
+    graph.starts[0] = start
+    graph.banks[:1].copy_(bank)
+    graph.bonus[:1].copy_(bonus)
+    torch.testing.assert_close(graph.forward()[:1], expected, atol=3e-6, rtol=3e-6)
