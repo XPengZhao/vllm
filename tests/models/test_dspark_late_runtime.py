@@ -35,6 +35,7 @@ def runtime_class():
     stage_spec.loader.exec_module(module)
 
     scope = dict(
+        record_function_or_nullcontext=lambda name: nullcontext(),
         device_ints=module.device_ints,
         torch=torch,
         Callable=Callable,

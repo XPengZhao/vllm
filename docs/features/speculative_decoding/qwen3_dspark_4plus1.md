@@ -167,16 +167,86 @@ bank/lag fields (or their absence in legacy exports). Restore `overlap` to
 `true` (or remove that field) to enable concurrency again.
 The serving CLI's global `--hf-overrides` does not override this draft config.
 
-For a GPU timeline, add a torch profiler configuration, call `/start_profile`,
-send several warm requests, then call `/stop_profile`:
+## GPU timeline profiling
+
+Use Nsight Systems to compare the target and bank CUDA streams, including CUDA
+Graph nodes. Keep the existing serving settings (in particular graph mode,
+proposal length and overlap) and add the following profiling options. Install
+`nvtx` in the serving environment if it is not already available:
 
 ```bash
---profiler-config '{"profiler":"torch","torch_profiler_dir":"/home/user/logs/4plus1-traces","torch_profiler_with_stack":false}'
+cd "$HOME/vllm"
+uv pip install --python .venv/bin/python nvtx
+mkdir -p "$HOME/logs/qwen3-4b/profiles"
+export VLLM_NVTX_SCOPES_FOR_PROFILING=1
+export VLLM_CUSTOM_SCOPES_FOR_PROFILING=0
+
+# Prepend this to your existing vllm serve command:
+nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=repeat \
+  --output="$HOME/logs/qwen3-4b/profiles/drawspec-overlap-on" \
+  .venv/bin/vllm serve <target-model> <your-existing-serving-options> \
+  --profiler-config '{"profiler":"cuda","ignore_frontend":true}'
 ```
 
-Inspect `dspark4plus1.prepare_bank` and `dspark4plus1.finish` in the worker
-trace. Confirm bank kernels run on a different CUDA stream and overlap target
-verification kernels; CPU scope overlap alone is insufficient. Compare serial
-and concurrent runs under identical prompts, sampling, cache and concurrency
-settings. This checkout was developed without a CUDA device: real GPU serving,
-overlap duration and end-to-end speedup require the server validation above.
+After startup and graph capture complete, use a second terminal to arm a short
+capture, then run the existing GSM8K evaluation command with the usual
+concurrency. The first 20 worker iterations are excluded; the next 100 are
+captured. This avoids tracing the full evaluation. The placeholders above are
+replaced by the model path and arguments from your existing server command.
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:11443/start_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"delay_iterations":20,"max_iterations":100}'
+
+# Run your existing GSM8K command here (same prompts, sampling and concurrency).
+
+# Also stops a capture if the workload ended before 100 iterations.
+curl --fail-with-body -X POST http://127.0.0.1:11443/stop_profile
+```
+
+Stop the server normally when finished so Nsight can finalize the reports.
+Open the generated `.nsys-rep` in Nsight Systems. For the serial control, restart
+with `overlap=false` and a different output name such as `drawspec-overlap-off`.
+Use unprofiled runs for final latency comparisons; graph-node tracing adds
+measurement overhead.
+
+| Range | Work submitted inside the range |
+| --- | --- |
+| `target.forward` | Target forward, including verification (also prefill) |
+| `target.sample` | Target logits, sampling and speculative rejection |
+| `drawspec.bank` | Old-prefix bank, on the background stream when overlap is enabled |
+| `drawspec.decode_gpu` | Uniform decode path with GPU-resident boundaries |
+| `drawspec.context_update` | Projection and writes of newly accepted context K/V |
+| `drawspec.wait_bank` | Submission of the stream dependency on the bank event |
+| `drawspec.final` | Final conditioning layer |
+| `drawspec.sample` | Draft logits and sampling, including Markov correction |
+| `drawspec.resolve_lengths_cpu` | Fallback boundary transfer to the CPU |
+| `drawspec.rebuild_bank` | Bootstrap or legacy full-accept bank rebuild |
+| `drawspec.fallback_finish` | Final proposal work outside the uniform decode path |
+
+Ranges label CPU submission, not GPU execution duration. Follow CUDA API / graph
+correlations to the GPU stream rows. In a steady decode round, measure target
+and bank kernel activity, their time intersection, and the bank tail after the
+target finishes. For an active-time overlap fraction, divide the intersection
+of the two kernel-time unions by the bank's kernel-time union; do not count idle
+gaps between kernels as overlap. Compare target duration with overlap on/off to
+identify resource contention. Inspect main-stream gaps before `drawspec.final`
+and distinguish bank dependencies from CPU launch delays. Frequent
+`resolve_lengths_cpu` or `rebuild_bank` ranges identify fallback work.
+
+For a PyTorch trace instead, set `VLLM_CUSTOM_SCOPES_FOR_PROFILING=1`, unset
+`VLLM_NVTX_SCOPES_FOR_PROFILING`, and use:
+
+```bash
+--profiler-config '{"profiler":"torch","torch_profiler_dir":"/home/user/logs/drawspec-traces","torch_profiler_with_stack":false,"ignore_frontend":true}'
+```
+
+The same HTTP capture controls and range names apply. With both scope flags
+unset, these annotations are no-ops. They introduce no CUDA synchronization,
+new CUDA events or changes to stream dependencies.

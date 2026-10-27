@@ -13,6 +13,7 @@ from vllm.model_executor.models.dspark_late import (
     LateSamplingGraph,
     device_ints,
 )
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -292,7 +293,7 @@ class LateDSparkSpeculator(DraftModelSpeculator):
         stream.wait_event(self.prefix_ready)
         with (
             torch.cuda.stream(stream),
-            torch.autograd.profiler.record_function("dspark4plus1.prepare_bank"),
+            record_function_or_nullcontext("drawspec.bank"),
         ):
             if any(state.bank is not None for state in jobs):
                 raise RuntimeError("4+1 bank from the previous round was not consumed")
@@ -345,22 +346,28 @@ class LateDSparkSpeculator(DraftModelSpeculator):
         bucket = next(n for n in self.stages.graph_batches if n >= slots.numel())
         features = torch.cat(aux, dim=-1)[: slots.numel() * width]
         # This writes only [old, new). The background bank reads only [0, old).
-        self.stages.context_graphs[bucket].replay(features, slots, old, counts)
+        with record_function_or_nullcontext("drawspec.context_update"):
+            self.stages.context_graphs[bucket].replay(features, slots, old, counts)
         main = torch.cuda.current_stream(self.device)
         states = [self.contexts[req] for req in input_batch.req_ids]
-        for event in {s.ready for s in states}:
-            main.wait_event(event)
-        for state in states:
-            assert state.bank is not None
-            state.bank.record_stream(main)
+        with record_function_or_nullcontext("drawspec.wait_bank"):
+            for event in {s.ready for s in states}:
+                main.wait_event(event)
+            for state in states:
+                assert state.bank is not None
+                state.bank.record_stream(main)
         banks = torch.stack([s.bank for s in states])
         bonus = last_sampled[slots, 0]
         graph = self.stages.select_graph(slots.numel(), self._fast_capacity, True)
-        hidden = graph.replay_tensors(
-            slots, lengths, bank_starts, banks, self.model.model.embed_tokens(bonus)
-        )
+        with record_function_or_nullcontext("drawspec.final"):
+            hidden = graph.replay_tensors(
+                slots, lengths, bank_starts, banks, self.model.model.embed_tokens(bonus)
+            )
         mapping = torch.where(num_sampled > 0, input_batch.idx_mapping, -1)
-        tokens = self.sampling_graphs[bucket].replay(hidden, mapping, lengths, bonus)
+        with record_function_or_nullcontext("drawspec.sample"):
+            tokens = self.sampling_graphs[bucket].replay(
+                hidden, mapping, lengths, bonus
+            )
         output = self.draft_tokens[: slots.numel()]
         output.copy_(torch.where((num_sampled > 0)[:, None], tokens, -1))
         self.gpu_lengths[slots] = lengths
@@ -414,22 +421,24 @@ class LateDSparkSpeculator(DraftModelSpeculator):
         if not aux_hidden_states:
             raise ValueError("4+1 requires target auxiliary features")
         if getattr(self, "_fast_decode", False):
-            return self._propose_gpu_decode(
-                input_batch,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                temperature,
-                seeds,
-            )
+            with record_function_or_nullcontext("drawspec.decode_gpu"):
+                return self._propose_gpu_decode(
+                    input_batch,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    temperature,
+                    seeds,
+                )
         main = torch.cuda.current_stream(self.device)
         # Resolve scalar lengths once after verification. Bank execution is
         # already in flight and can overlap both target forward and sampling.
         starts = input_batch.positions[
             input_batch.query_start_loc[: input_batch.num_reqs].long()
         ]
-        counts = torch.stack((num_sampled, num_rejected, starts)).cpu().tolist()
+        with record_function_or_nullcontext("drawspec.resolve_lengths_cpu"):
+            counts = torch.stack((num_sampled, num_rejected, starts)).cpu().tolist()
         features = torch.cat(aux_hidden_states, dim=-1)
         self._copy_request_inputs(
             input_batch.num_reqs, input_batch.idx_mapping, temperature, seeds
@@ -468,51 +477,59 @@ class LateDSparkSpeculator(DraftModelSpeculator):
                 state.bank_start = state.length + 1
                 rebuild.append(state)
             active.append((i, state))
-        if updates:
-            if hasattr(self, "gpu_lengths"):
-                slots = device_ints([u[0] for u in updates], self.device)
-                self.gpu_lengths[slots] = device_ints(
-                    [start + end - left for _, start, left, end in updates], self.device
+        with record_function_or_nullcontext("drawspec.context_update"):
+            if updates:
+                if hasattr(self, "gpu_lengths"):
+                    slots = device_ints([u[0] for u in updates], self.device)
+                    self.gpu_lengths[slots] = device_ints(
+                        [start + end - left for _, start, left, end in updates],
+                        self.device,
+                    )
+                self.stages.append_context_batch(
+                    [u[0] for u in updates],
+                    [u[1] for u in updates],
+                    torch.cat([features[left:end] for _, _, left, end in updates]),
+                    [end - left for _, _, left, end in updates],
                 )
-            self.stages.append_context_batch(
-                [u[0] for u in updates],
-                [u[1] for u in updates],
-                torch.cat([features[left:end] for _, _, left, end in updates]),
-                [end - left for _, _, left, end in updates],
-            )
-        for event in {event for event, _ in pending_reads}:
-            main.wait_event(event)
-        for _, bank in pending_reads:
-            bank.record_stream(main)
+        with record_function_or_nullcontext("drawspec.wait_bank"):
+            for event in {event for event, _ in pending_reads}:
+                main.wait_event(event)
+            for _, bank in pending_reads:
+                bank.record_stream(main)
         if rebuild:
-            banks = self.stages.prepare_bank_batch(
-                [s.slot for s in rebuild],
-                [s.length for s in rebuild],
-                [s.bank_start for s in rebuild],
-            )
-            for state, bank in zip(rebuild, banks.unbind(0)):
-                state.bank = bank
+            with record_function_or_nullcontext("drawspec.rebuild_bank"):
+                banks = self.stages.prepare_bank_batch(
+                    [s.slot for s in rebuild],
+                    [s.length for s in rebuild],
+                    [s.bank_start for s in rebuild],
+                )
+                for state, bank in zip(rebuild, banks.unbind(0)):
+                    state.bank = bank
         if not active:
             return output
-        with torch.autograd.profiler.record_function("dspark4plus1.finish"):
+        with record_function_or_nullcontext("drawspec.fallback_finish"):
             batch_rows = device_ints([i for i, _ in active], self.device)
             mapping = input_batch.idx_mapping[batch_rows]
             bonus = last_sampled[mapping.long(), 0]
             lengths = [s.length for _, s in active]
-            hidden = self.stages.finish_batch(
-                [s.slot for _, s in active],
-                lengths,
-                torch.stack([s.bank for _, s in active]),
-                [s.bank_start for _, s in active],
-                self.model.model.embed_tokens(bonus),
-            )
+            with record_function_or_nullcontext("drawspec.final"):
+                hidden = self.stages.finish_batch(
+                    [s.slot for _, s in active],
+                    lengths,
+                    torch.stack([s.bank for _, s in active]),
+                    [s.bank_start for _, s in active],
+                    self.model.model.embed_tokens(bonus),
+                )
             positions = device_ints(lengths, self.device)
-            graphs = self.sampling_graphs
-            if graphs:
-                bucket = next(n for n in self.stages.graph_batches if n >= len(active))
-                tokens = graphs[bucket].replay(hidden, mapping, positions, bonus)
-            else:
-                tokens = self._sample_hidden(hidden, mapping, positions, bonus)
+            with record_function_or_nullcontext("drawspec.sample"):
+                graphs = self.sampling_graphs
+                if graphs:
+                    bucket = next(
+                        n for n in self.stages.graph_batches if n >= len(active)
+                    )
+                    tokens = graphs[bucket].replay(hidden, mapping, positions, bonus)
+                else:
+                    tokens = self._sample_hidden(hidden, mapping, positions, bonus)
             output[batch_rows] = tokens
         for _, state in active:
             state.bank = state.ready = None
