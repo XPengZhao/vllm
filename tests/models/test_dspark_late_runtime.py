@@ -117,9 +117,16 @@ def test_configuration_accepts_both_bank_versions_and_rejects_unsafe_modes():
     "proposal_length,accepted", [(n, a) for n in (1, 6, 7) for a in range(n + 1)]
 )
 @pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("gpu_decode", [False, True])
 @pytest.mark.parametrize("cursor_upper_bound", [0, 7])
 def test_prefill_mixed_acceptance_reorder_and_request_reuse(
-    monkeypatch, bank_size, proposal_length, accepted, overlap, cursor_upper_bound
+    monkeypatch,
+    bank_size,
+    proposal_length,
+    accepted,
+    overlap,
+    cursor_upper_bound,
+    gpu_decode,
 ):
     helper_spec = importlib.util.spec_from_file_location(
         "stage_tests", Path(__file__).with_name("test_dspark_late.py")
@@ -186,6 +193,27 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
         markov_bias=ref.markov_head.project_bias,
     )
 
+    if gpu_decode:
+        runtime.gpu_lengths = torch.zeros(2, dtype=torch.long)
+        runtime.num_speculative_steps = proposal_length
+        runtime.max_model_len = 128
+        stages.init_context_projection()
+        stages.graph_batches = [1, 2]
+        stage_graphs = {}
+        for finish in (False, True):
+            graph = helper.module.LateStageGraph(stages, 2, 128, finish)
+            graph.output = graph.forward()
+            graph.graph = SimpleNamespace(
+                replay=lambda g=graph: g.output.copy_(g.forward())
+            )
+            stage_graphs[finish] = graph
+        stages.select_graph = lambda batch, length, finish: stage_graphs[finish]
+        for n in (1, 2):
+            graph = helper.module.LateContextGraph(stages, n)
+            graph.graph = SimpleNamespace(replay=graph.forward)
+            stages.context_graphs[n] = graph
+            runtime.sampling_graphs[n] = SimpleNamespace(replay=runtime._sample_hidden)
+
     def batch(ids, slots, starts, widths, drafts):
         return SimpleNamespace(
             req_ids=ids,
@@ -250,11 +278,18 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
         [proposal_length - accepted, proposal_length],
     )
     assert sampling_calls == [(2, step) for step in range(proposal_length)] * 2
-    assert runtime.contexts["b"].length == 8 + accepted
-    assert runtime.contexts["a"].length == 6  # none accepted
+    fast = gpu_decode and (bank_size == 13 or proposal_length <= 6)
+    assert runtime._fast_decode == fast
+    if fast:
+        assert runtime.gpu_lengths.tolist() == [8 + accepted, 6]
+    else:
+        assert runtime.contexts["b"].length == 8 + accepted
+        assert runtime.contexts["a"].length == 6  # none accepted
     fallback = bank_size == 12 and accepted == 7
-    assert len(prepared) == 2 + int(fallback)
-    assert len(prepared[0]) == len(prepared[1]) == 2
+    assert len(prepared) == (1 if fast else 2 + int(fallback))
+    assert len(prepared[0]) == 2
+    if not fast:
+        assert len(prepared[1]) == 2
     if fallback:
         assert prepared[-1] == [(0, 15, 16)]
     expected = []
@@ -295,13 +330,39 @@ def test_prefill_mixed_acceptance_reorder_and_request_reuse(
         state.bank is None and state.ready is None
         for state in runtime.contexts.values()
     )
+    if fast:
+        # A second decode round must use GPU lengths, not stale CPU state.
+        third = batch(
+            ["b", "a"],
+            [0, 1],
+            [8 + accepted, 6],
+            [proposal_length + 1] * 2,
+            [proposal_length] * 2,
+        )
+
+        def forbid_cpu(*args, **kwargs):
+            raise AssertionError("decode attempted a GPU-to-CPU transfer")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.Tensor, "cpu", forbid_cpu)
+            runtime.begin_verification(third)
+            runtime.launch_verification_bank()
+            propose(
+                third,
+                torch.randn(2 * (proposal_length + 1), 32),
+                [1, 1],
+                [proposal_length, proposal_length],
+            )
+        assert runtime.gpu_lengths.tolist() == [9 + accepted, 7]
     # A preempted/reused request starts with no stale bank or old cursor.
     runtime.remove_request("a")
     assert "a" not in runtime.contexts
     reused = batch(["a"], [1], [0], [3], [0])
+    runtime.begin_verification(reused)
     propose(reused, torch.randn(3, 32), [1], [0])
     assert runtime.contexts["a"].length == 3
     invalid = batch(["a"], [1], [4], [8], [7])
+    runtime._fast_decode = False
     with pytest.raises(ValueError, match="cursor"):
         propose(invalid, torch.randn(8, 32), [1], [7])
     assert runtime.contexts["a"].length == 3
@@ -469,6 +530,8 @@ def test_graph_configuration_and_profiling_cleanup(mode, draft_eager):
     runtime.init_cudagraph_manager(SimpleNamespace(name=mode))
     assert runtime.graph_enabled == (mode != "NONE" and not draft_eager)
     runtime.sampling_graphs = {1: object()}
-    runtime.stages = SimpleNamespace(graphs={(False, 1, 128): object()})
+    runtime.stages = SimpleNamespace(
+        graphs={(False, 1, 128): object()}, context_graphs={1: object()}
+    )
     runtime.clear_cudagraphs()
     assert not runtime.sampling_graphs and not runtime.stages.graphs

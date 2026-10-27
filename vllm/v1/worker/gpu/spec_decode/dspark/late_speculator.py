@@ -123,6 +123,11 @@ class LateDSparkSpeculator(DraftModelSpeculator):
         self.pending_jobs = []
         self.sampling_graphs = {}
         self.graph_enabled = False
+        self._fast_decode = False
+        self._gpu_lengths_dirty = False
+        self.gpu_lengths = torch.zeros(
+            self.max_num_reqs, device=device, dtype=torch.long
+        )
 
     def load_draft_model(self, target_model, target_attn_layer_names):
         model = load_dspark_model(target_model, self.vllm_config)
@@ -181,14 +186,19 @@ class LateDSparkSpeculator(DraftModelSpeculator):
             )
         stream.synchronize()
         logger.info(
-            "DSpark 4+1 captured %d stage graphs and %d sampling graphs",
+            "DSpark 4+1 captured %d stage, %d context and %d sampling graphs",
             len(self.stages.graphs),
+            len(self.stages.context_graphs),
             len(self.sampling_graphs),
         )
 
     def clear_cudagraphs(self):
         self.sampling_graphs.clear()
         self.stages.graphs.clear()
+        self.stages.context_graphs.clear()
+        for name in ("context_weight", "context_norm", "context_eps"):
+            if hasattr(self.stages, name):
+                delattr(self.stages, name)
 
     def _sample_hidden(self, hidden, mapping, positions, bonus):
         logits = self.model.compute_draft_logits(hidden.flatten(0, 1)).view(
@@ -214,6 +224,47 @@ class LateDSparkSpeculator(DraftModelSpeculator):
     def begin_verification(self, input_batch):
         """Snapshot old-prefix jobs and the event before target forward."""
         main = torch.cuda.current_stream(self.device)
+        drafts = input_batch.num_draft_tokens_per_req
+        self._fast_decode = bool(
+            getattr(self, "sampling_graphs", {})
+            and self.stages.context_graphs
+            and (self.stages.bank_size == 13 or self.num_speculative_steps <= 6)
+            and drafts is not None
+            and all(int(n) == self.num_speculative_steps for n in drafts)
+            and all(
+                int(b - a) == self.num_speculative_steps + 1
+                for a, b in zip(
+                    input_batch.query_start_loc_np, input_batch.query_start_loc_np[1:]
+                )
+            )
+            and all(req in self.contexts for req in input_batch.req_ids)
+        )
+        if not self._fast_decode and getattr(self, "_gpu_lengths_dirty", False):
+            states = list(self.contexts.values())
+            slots = device_ints([s.slot for s in states], self.device)
+            for cached_state, length in zip(
+                states, self.gpu_lengths[slots].cpu().tolist()
+            ):
+                cached_state.length = length
+            self._gpu_lengths_dirty = False
+        if self._fast_decode:
+            for i, req in enumerate(input_batch.req_ids):
+                if self.contexts[req].slot != int(input_batch.idx_mapping_np[i]):
+                    raise ValueError("4+1 request slot changed without reset")
+            slots = input_batch.idx_mapping.long()
+            old = self.gpu_lengths[slots]
+            self._fast_inputs = (slots, old, old + 2)
+            # CPU counts are upper bounds; only select capacity with them.
+            self._fast_capacity = min(
+                self.max_model_len,
+                int(max(input_batch.num_computed_tokens_np))
+                + self.num_speculative_steps
+                + 1,
+            )
+            torch._assert_async(
+                torch.all(self._fast_inputs[1] <= self._fast_capacity),
+                "4+1 prefix exceeds graph capacity",
+            )
         jobs = []
         for i, req_id in enumerate(input_batch.req_ids):
             state = self.contexts.get(req_id)
@@ -243,22 +294,80 @@ class LateDSparkSpeculator(DraftModelSpeculator):
             torch.cuda.stream(stream),
             torch.autograd.profiler.record_function("dspark4plus1.prepare_bank"),
         ):
-            for state in jobs:
-                if state.bank is not None:
-                    raise RuntimeError(
-                        "4+1 bank from the previous round was not consumed"
-                    )
-                state.bank_start = state.length + 2
-            banks = self.stages.prepare_bank_batch(
-                [state.slot for state in jobs],
-                [state.length for state in jobs],
-                [state.bank_start for state in jobs],
-            )
+            if any(state.bank is not None for state in jobs):
+                raise RuntimeError("4+1 bank from the previous round was not consumed")
+            if self._fast_decode:
+                graph = self.stages.select_graph(len(jobs), self._fast_capacity, False)
+                banks = graph.replay_tensors(*self._fast_inputs)
+            else:
+                for state in jobs:
+                    state.bank_start = state.length + 2
+                banks = self.stages.prepare_bank_batch(
+                    [state.slot for state in jobs],
+                    [state.length for state in jobs],
+                    [state.bank_start for state in jobs],
+                )
             ready = torch.cuda.Event()
             ready.record(stream)
             for state, bank in zip(jobs, banks.unbind(0)):
                 state.bank = bank
                 state.ready = ready
+
+    def _propose_gpu_decode(
+        self,
+        input_batch,
+        aux,
+        num_sampled,
+        num_rejected,
+        last_sampled,
+        temperature,
+        seeds,
+    ):
+        slots, old, bank_starts = self._fast_inputs
+        width = self.num_speculative_steps + 1
+        starts = input_batch.positions[
+            input_batch.query_start_loc[: input_batch.num_reqs].long()
+        ]
+        counts = width - num_rejected
+        lengths = old + counts
+        torch._assert_async(
+            torch.all(
+                (starts == old)
+                & (counts >= 1)
+                & (counts <= width)
+                & (lengths <= self._fast_capacity)
+            ),
+            "4+1 decode cursor or accepted length is invalid",
+        )
+        self._copy_request_inputs(
+            input_batch.num_reqs, input_batch.idx_mapping, temperature, seeds
+        )
+        bucket = next(n for n in self.stages.graph_batches if n >= slots.numel())
+        features = torch.cat(aux, dim=-1)[: slots.numel() * width]
+        # This writes only [old, new). The background bank reads only [0, old).
+        self.stages.context_graphs[bucket].replay(features, slots, old, counts)
+        main = torch.cuda.current_stream(self.device)
+        states = [self.contexts[req] for req in input_batch.req_ids]
+        for event in {s.ready for s in states}:
+            main.wait_event(event)
+        for state in states:
+            assert state.bank is not None
+            state.bank.record_stream(main)
+        banks = torch.stack([s.bank for s in states])
+        bonus = last_sampled[slots, 0]
+        graph = self.stages.select_graph(slots.numel(), self._fast_capacity, True)
+        hidden = graph.replay_tensors(
+            slots, lengths, bank_starts, banks, self.model.model.embed_tokens(bonus)
+        )
+        mapping = torch.where(num_sampled > 0, input_batch.idx_mapping, -1)
+        tokens = self.sampling_graphs[bucket].replay(hidden, mapping, lengths, bonus)
+        output = self.draft_tokens[: slots.numel()]
+        output.copy_(torch.where((num_sampled > 0)[:, None], tokens, -1))
+        self.gpu_lengths[slots] = lengths
+        self._gpu_lengths_dirty = True
+        for state in states:
+            state.bank = state.ready = None
+        return output
 
     @torch.inference_mode()
     def propose(
@@ -304,6 +413,16 @@ class LateDSparkSpeculator(DraftModelSpeculator):
             return self.draft_tokens[: input_batch.num_reqs].fill_(0)
         if not aux_hidden_states:
             raise ValueError("4+1 requires target auxiliary features")
+        if getattr(self, "_fast_decode", False):
+            return self._propose_gpu_decode(
+                input_batch,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                temperature,
+                seeds,
+            )
         main = torch.cuda.current_stream(self.device)
         # Resolve scalar lengths once after verification. Bank execution is
         # already in flight and can overlap both target forward and sampling.
@@ -318,7 +437,7 @@ class LateDSparkSpeculator(DraftModelSpeculator):
         output = self.draft_tokens[: input_batch.num_reqs]
         output.fill_(-1)
         updates, active, rebuild = [], [], []
-        waited = set()
+        pending_reads = []
         for i, req_id in enumerate(input_batch.req_ids):
             slot = int(input_batch.idx_mapping_np[i])
             start = counts[2][i]
@@ -335,10 +454,7 @@ class LateDSparkSpeculator(DraftModelSpeculator):
                 raise ValueError("invalid 4+1 accepted-context length")
             if state.ready is not None:
                 assert state.bank is not None
-                if state.ready not in waited:
-                    main.wait_event(state.ready)
-                    waited.add(state.ready)
-                state.bank.record_stream(main)
+                pending_reads.append((state.ready, state.bank))
             updates.append((slot, start, left, end))
             state.length += end - left
             if not counts[0][i]:
@@ -353,12 +469,21 @@ class LateDSparkSpeculator(DraftModelSpeculator):
                 rebuild.append(state)
             active.append((i, state))
         if updates:
+            if hasattr(self, "gpu_lengths"):
+                slots = device_ints([u[0] for u in updates], self.device)
+                self.gpu_lengths[slots] = device_ints(
+                    [start + end - left for _, start, left, end in updates], self.device
+                )
             self.stages.append_context_batch(
                 [u[0] for u in updates],
                 [u[1] for u in updates],
                 torch.cat([features[left:end] for _, _, left, end in updates]),
                 [end - left for _, _, left, end in updates],
             )
+        for event in {event for event, _ in pending_reads}:
+            main.wait_event(event)
+        for _, bank in pending_reads:
+            bank.record_stream(main)
         if rebuild:
             banks = self.stages.prepare_bank_batch(
                 [s.slot for s in rebuild],

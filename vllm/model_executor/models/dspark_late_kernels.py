@@ -76,3 +76,62 @@ def pack_kv(
         width,
         1024,
     )
+
+
+@triton.jit
+def _store_context(
+    k,
+    v,
+    slots,
+    starts,
+    counts,
+    cache,
+    K0: tl.constexpr,
+    K1: tl.constexpr,
+    V0: tl.constexpr,
+    V1: tl.constexpr,
+    LAYER_STRIDE: tl.constexpr,
+    KV_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    POS_STRIDE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    CHANNELS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token, layer = tl.program_id(0), tl.program_id(1)
+    req, col = token // WIDTH, token % WIDTH
+    if col < tl.load(counts + req):
+        channel = tl.arange(0, BLOCK)
+        mask = channel < CHANNELS
+        slot, pos = tl.load(slots + req), tl.load(starts + req) + col
+        dst = layer * LAYER_STRIDE + slot * SLOT_STRIDE + pos * POS_STRIDE + channel
+        tl.store(
+            cache + dst,
+            tl.load(k + token * K0 + layer * K1 + channel, mask=mask),
+            mask=mask,
+        )
+        tl.store(
+            cache + dst + KV_STRIDE,
+            tl.load(v + token * V0 + layer * V1 + channel, mask=mask),
+            mask=mask,
+        )
+
+
+def store_context(k, v, slots, starts, counts, cache, width):
+    channels = k.shape[-2] * k.shape[-1]
+    _store_context[(k.shape[0], k.shape[1])](
+        k,
+        v,
+        slots,
+        starts,
+        counts,
+        cache,
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        *cache.stride()[:4],
+        width,
+        channels,
+        triton.next_power_of_2(channels),
+    )

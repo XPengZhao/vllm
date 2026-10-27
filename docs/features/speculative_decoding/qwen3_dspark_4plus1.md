@@ -80,11 +80,20 @@ Unused capacity is neither gathered nor written, and attention reads only the
 actual per-request lengths. Padding cannot enter
 another request's attention or sampling cache.
 
-Bank, final-layer, and sampling graphs have separate memory pools. Bank replay
+Bank, context-update, final-layer, and sampling graphs have separate memory pools. Bank replay
 stays on the background stream, and graph outputs are copied before reuse,
 including legacy full-acceptance rebuilds. There is no runtime graph capture.
-Request bookkeeping, accepted-context K/V updates and metadata transfers remain
-eager; resolving acceptance counts still performs one CPU read per round.
+For uniform decode batches, the 13-state model and legacy models with N<=6
+keep committed lengths and acceptance counts on the GPU. A separate context
+update graph projects all five layers' K/V in one GEMM and stores only accepted
+positions. It writes the new suffix while the background bank reads the old
+prefix; the main stream waits for the bank only before consuming its output.
+Graph capacity is selected from CPU upper bounds, with cursor checks on the GPU.
+
+Mixed prefill/decode, irregular query lengths, eager mode and legacy N=7 use the
+checked fallback. Returning to that path refreshes CPU cursor state once.
+Request bookkeeping remains on the CPU; the uniform decode path does not copy
+acceptance counts to the CPU. Context attention still packs valid K/V each layer.
 
 No new launch flag is required. Keep target CUDA graphs enabled and omit
 `--enforce-eager`. To compare against eager drafting while retaining target
@@ -122,9 +131,8 @@ background bank. Serial mode uses the same boundary policy.
 
 Target and draft stages have distinct context K/V and use no shared vLLM
 attention/workspace buffers. Request removal waits on outstanding bank reads
-before its cache slot can be reused. CPU-side length resolution after sampling
-currently synchronizes once per batch; this path prioritizes correctness over
-maximum throughput and does not claim a measured speedup.
+before its cache slot can be reused. Fallback batches resolve lengths on the
+CPU; the uniform decode path keeps those lengths on the GPU.
 
 ## Validate on the server
 

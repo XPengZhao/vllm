@@ -528,3 +528,64 @@ def test_variable_final_block_matches_reference_and_graph(
     graph.banks[:1].copy_(bank)
     graph.bonus[:1].copy_(bonus)
     torch.testing.assert_close(graph.forward()[:1], expected, atol=3e-6, rtol=3e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("proposal_length", [1, 6, 7])
+@torch.inference_mode()
+def test_fused_decode_context_matches_eager_and_preserves_rejected_rows(
+    dtype, proposal_length
+):
+    _, stages = pair(dtype, num_speculative_tokens=proposal_length)
+    stages.kv.fill_(123)
+    stages.init_context_projection()
+    graph = module.LateContextGraph(stages, 2)
+    width = proposal_length + 1
+    graph.features.normal_()
+    graph.slots.copy_(torch.tensor([1, 0]))
+    graph.starts.copy_(torch.tensor([9, 3]))
+    graph.counts.copy_(torch.tensor([width, 1]))
+    stages.append_context_batch(
+        [1, 0],
+        [9, 3],
+        torch.cat((graph.features[:width], graph.features[width : width + 1])),
+        [width, 1],
+    )
+    expected = stages.kv.clone()
+    stages.kv.fill_(123)
+    graph.forward()
+    tolerance = 3e-2 if dtype == torch.bfloat16 else 3e-6
+    torch.testing.assert_close(stages.kv, expected, atol=tolerance, rtol=tolerance)
+    assert (stages.kv[:, :, 0, 4:] == 123).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("proposal_length", [6, 7])
+@torch.inference_mode()
+def test_context_graph_update_can_overlap_bank_without_rejected_writes(proposal_length):
+    _, stages = pair(torch.bfloat16, "cuda", num_speculative_tokens=proposal_length)
+    stages.kv.fill_(123)
+    stages.append_context_batch(
+        [0, 1], [0, 0], torch.randn(12, 32, device="cuda", dtype=torch.bfloat16), [5, 7]
+    )
+    expected_bank = stages.prepare_bank_batch([1, 0], [7, 5], [9, 7])
+    stages.capture_graphs()
+    width = proposal_length + 1
+    features = torch.randn(2 * width, 32, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([1, 0], device="cuda")
+    starts = torch.tensor([7, 5], device="cuda")
+    counts = torch.tensor([1, width], device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        actual_bank = stages.prepare_bank_batch([1, 0], [7, 5], [9, 7])
+    stages.context_graphs[2].replay(features, slots, starts, counts)
+    torch.cuda.current_stream().wait_stream(stream)
+    actual_bank.record_stream(torch.cuda.current_stream())
+    torch.testing.assert_close(actual_bank, expected_bank, atol=3e-2, rtol=3e-2)
+    after = stages.kv.clone()
+    assert (after[:, :, 1, 8:] == 123).all()
+    stages.append_context_batch(
+        [1, 0], [7, 5], torch.cat((features[:1], features[width:])), [1, width]
+    )
+    torch.testing.assert_close(after, stages.kv, atol=3e-2, rtol=3e-2)

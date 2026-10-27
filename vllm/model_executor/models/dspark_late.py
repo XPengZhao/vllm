@@ -43,6 +43,7 @@ class LateConditioningStages:
     ):
         self.num_query_per_req = num_speculative_tokens
         self.graphs = {}
+        self.context_graphs = {}
         self.model = model
         self.backbone = model.model
         config = model.config
@@ -93,6 +94,18 @@ class LateConditioningStages:
             dtype=dtype,
         )
 
+    def init_context_projection(self):
+        if hasattr(self, "context_weight"):
+            return
+        attns = [layer.self_attn for layer in self.backbone.layers]
+        self.context_weight = torch.cat([a.qkv_proj.weight[a.q_size :] for a in attns])
+        self.context_norm = torch.stack([a.k_norm.weight for a in attns])[
+            None, :, None, :
+        ]
+        self.context_eps = torch.tensor(
+            [a.k_norm.variance_epsilon for a in attns], device=self.kv.device
+        )[None, :, None, None]
+
     def select_graph(self, batch, length, finish):
         if not self.graphs:
             return None
@@ -117,6 +130,12 @@ class LateConditioningStages:
                     stream.wait_stream(torch.cuda.current_stream(self.kv.device))
                     graph.capture(pool, stream)
                     self.graphs[finish, batch, capacity] = graph
+        self.init_context_projection()
+        pool = torch.cuda.graph_pool_handle()
+        for batch in reversed(self.graph_batches):
+            context_graph = LateContextGraph(self, batch)
+            context_graph.capture(pool, stream)
+            self.context_graphs[batch] = context_graph
         stream.synchronize()
 
     def rope(self, x, positions):
@@ -403,16 +422,22 @@ class LateStageGraph:
             self.output = self.forward()
 
     def replay(self, slots, lengths, starts, banks=None, bonus=None):
-        count = len(slots)
-        self.slots.copy_(
-            device_ints([*slots, *([0] * (self.batch - count))], self.slots.device)
+        return self.replay_tensors(
+            device_ints(slots, self.slots.device),
+            device_ints(lengths, self.slots.device),
+            device_ints(starts, self.slots.device),
+            banks,
+            bonus,
         )
-        self.lengths.copy_(
-            device_ints([*lengths, *([0] * (self.batch - count))], self.slots.device)
-        )
-        self.starts.copy_(
-            device_ints([*starts, *([1] * (self.batch - count))], self.slots.device)
-        )
+
+    def replay_tensors(self, slots, lengths, starts, banks=None, bonus=None):
+        count = slots.numel()
+        self.slots.zero_()
+        self.lengths.zero_()
+        self.starts.fill_(1)
+        self.slots[:count].copy_(slots)
+        self.lengths[:count].copy_(lengths)
+        self.starts[:count].copy_(starts)
         if self.finish:
             assert self.banks is not None and self.bonus is not None
             self.banks[:count].copy_(banks)
@@ -459,3 +484,74 @@ class LateSamplingGraph:
         self.bonus[:count].copy_(bonus)
         self.graph.replay()
         return self.output[:count].clone()
+
+
+class LateContextGraph:
+    """Decode-only context update. Rejected and padded rows never write K/V."""
+
+    def __init__(self, stages, batch):
+        self.stages = stages
+        self.width = stages.num_query_per_req + 1
+        device, dtype = stages.kv.device, stages.kv.dtype
+        self.features = torch.zeros(
+            batch * self.width,
+            stages.backbone.fc.weight.shape[1],
+            device=device,
+            dtype=dtype,
+        )
+        self.slots = torch.zeros(batch, device=device, dtype=torch.long)
+        self.starts = torch.zeros_like(self.slots)
+        self.counts = torch.zeros_like(self.slots)
+
+    def forward(self):
+        s = self.stages
+        context = rms_norm(
+            F.linear(self.features, s.backbone.fc.weight), s.backbone.hidden_norm
+        )
+        kv = F.linear(context, s.context_weight).view(
+            -1, 5, 2, s.n_kv_heads, s.head_dim
+        )
+        k, v = kv[:, :, 0], kv[:, :, 1]
+        value = k.float()
+        k = (
+            value * torch.rsqrt(value.square().mean(-1, keepdim=True) + s.context_eps)
+        ).to(k.dtype) * s.context_norm
+        positions = (
+            self.starts[:, None] + torch.arange(self.width, device=k.device)
+        ).flatten()
+        k = s.rope(
+            k.reshape(-1, s.n_kv_heads, s.head_dim), positions.repeat_interleave(5)
+        ).view_as(k)
+        if k.is_cuda:
+            from vllm.model_executor.models.dspark_late_kernels import store_context
+
+            store_context(k, v, self.slots, self.starts, self.counts, s.kv, self.width)
+        else:
+            for i, (slot, start, count) in enumerate(
+                zip(self.slots.tolist(), self.starts.tolist(), self.counts.tolist())
+            ):
+                s.kv[:, 0, slot, start : start + count] = k[
+                    i * self.width : i * self.width + count
+                ].transpose(0, 1)
+                s.kv[:, 1, slot, start : start + count] = v[
+                    i * self.width : i * self.width + count
+                ].transpose(0, 1)
+
+    def capture(self, pool, stream):
+        stream.wait_stream(torch.cuda.current_stream(self.slots.device))
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self.forward()
+        stream.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=pool, stream=stream):
+            self.forward()
+
+    def replay(self, features, slots, starts, counts):
+        n = slots.numel()
+        self.features[: features.shape[0]].copy_(features)
+        self.slots[:n].copy_(slots)
+        self.starts[:n].copy_(starts)
+        self.counts.zero_()
+        self.counts[:n].copy_(counts)
+        self.graph.replay()
