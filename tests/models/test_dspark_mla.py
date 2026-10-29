@@ -547,3 +547,91 @@ def test_qwen_markov_sampling_uses_previous_token_and_raw_confidence_embedding(
     assert calls[0][0][:, 0].tolist() == [3, 0]
     assert calls[1][0][:, 0].tolist() == [1, 0]
     assert confidence_inputs[0][:, 0].tolist() == [3, 1, 0, 0]
+
+
+@pytest.mark.parametrize(
+    ("backbone", "head", "expected_mla"),
+    [("gqa", "vanilla", False), ("mla", "vanilla", False), ("mla", "mla", True)],
+)
+def test_qwen_backbone_and_markov_selection_are_independent(
+    monkeypatch, qwen_mla_module, backbone, head, expected_mla
+):
+    from vllm.model_executor.models import qwen3_dspark as module
+
+    class SelectedModel(Exception):
+        pass
+
+    def selected(*args, **kwargs):
+        raise SelectedModel
+
+    def wrong_model(*args, **kwargs):
+        pytest.fail("wrong backbone implementation selected")
+
+    monkeypatch.setattr(
+        module, "Qwen3DSparkModel", selected if backbone == "gqa" else wrong_model
+    )
+    monkeypatch.setattr(
+        qwen_mla_module,
+        "Qwen3DSparkMLAModel",
+        selected if backbone == "mla" else wrong_model,
+    )
+    hf = SimpleNamespace(
+        vocab_size=128,
+        draft_attention_type=backbone,
+        markov_head_type="mla" if head == "vanilla" else "vanilla",
+        dflash_config={"markov_head_type": head},
+    )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=hf)
+        ),
+        model_config=SimpleNamespace(get_total_num_hidden_layers=lambda: 36),
+    )
+    model = module.Qwen3DSparkForCausalLM.__new__(module.Qwen3DSparkForCausalLM)
+    with pytest.raises(SelectedModel):
+        model.__init__(vllm_config=config)
+    assert model.has_backbone_mla == (backbone == "mla")
+    assert model.has_markov_mla == expected_mla
+
+
+@pytest.mark.parametrize("mla_head", [False, True])
+def test_qwen_context_updates_only_existing_attention_caches(qwen_mla_module, mla_head):
+    """A vanilla head must never be projected or assigned a sixth cache slot."""
+    calls = []
+
+    def attention(index):
+        return SimpleNamespace(
+            project_kv=lambda positions, context: (context + index, context - index),
+            attn=SimpleNamespace(
+                kv_cache=index,
+                impl=SimpleNamespace(
+                    do_kv_cache_update=lambda attn, k, v, cache, slots: calls.append(
+                        (cache, k, v, slots)
+                    )
+                ),
+            ),
+        )
+
+    layers = [SimpleNamespace(self_attn=attention(i)) for i in range(5)]
+    head = nn.Identity()
+    if mla_head:
+        head = qwen_mla_module.Qwen3MarkovMLA.__new__(qwen_mla_module.Qwen3MarkovMLA)
+        nn.Module.__init__(head)
+        stub = attention(5)
+        head.project_kv = stub.project_kv
+        head.attn = stub.attn
+    model = SimpleNamespace(
+        layers=layers, markov_head=head, hidden_norm=lambda x: x * 2
+    )
+    count = 6 if mla_head else 5
+    slots = [torch.tensor([2 * i, 2 * i + 1]) for i in range(count)]
+    context = torch.randn(2, 6)
+    qwen_mla_module.Qwen3DSparkMLAModel.precompute_and_store_context_kv(
+        model, context, torch.tensor([0, 1]), slots
+    )
+    assert len(calls) == count
+    for i, (cache, key, value, mapping) in enumerate(calls):
+        assert cache == i
+        assert mapping is slots[i]
+        torch.testing.assert_close(key, context * 2 + i)
+        torch.testing.assert_close(value, context * 2 - i)

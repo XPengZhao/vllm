@@ -198,14 +198,13 @@ class Qwen3DSparkMLAModel(Qwen3DSparkModel):
                 "bias-free projections and NeoX RoPE"
             )
         if (
-            hf.dflash_config.get("markov_head_type") != "mla"
-            or getattr(hf, "dspark_draft_topk", None) is not None
+            getattr(hf, "dspark_draft_topk", None) is not None
             or not getattr(hf, "sample_from_anchor", True)
             or (getattr(hf, "draft_vocab_size", None) or hf.vocab_size) != hf.vocab_size
         ):
             raise ValueError(
                 "Qwen3 DSpark MLA requires full-vocab anchor sampling "
-                "with an MLA Markov head and no draft top-k"
+                "with no draft top-k"
             )
         if get_current_vllm_config().cache_config.cache_dtype != "auto":
             raise ValueError("Qwen3 DSpark MLA requires cache_dtype=auto")
@@ -221,7 +220,9 @@ class Qwen3DSparkMLAModel(Qwen3DSparkModel):
         self, context_states, context_positions, context_slot_mapping=None
     ):
         context = self.hidden_norm(context_states)
-        modules = [layer.self_attn for layer in self.layers] + [self.markov_head]
+        modules = [layer.self_attn for layer in self.layers]
+        if isinstance(self.markov_head, Qwen3MarkovMLA):
+            modules.append(self.markov_head)
         for index, module in enumerate(modules):
             key, value = module.project_kv(context_positions, context)
             slots = (

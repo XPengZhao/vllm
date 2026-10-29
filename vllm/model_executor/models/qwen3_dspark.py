@@ -264,16 +264,21 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         model_cls = Qwen3DSparkModel
-        self.has_markov_mla = (
+        self.has_backbone_mla = (
             getattr(self.config, "draft_attention_type", None) == "mla"
         )
-        if self.has_markov_mla:
+        dspark_config = getattr(self.config, "dflash_config", None) or {}
+        self.has_markov_mla = (
+            dspark_config.get(
+                "markov_head_type", getattr(self.config, "markov_head_type", "low_rank")
+            )
+            == "mla"
+        )
+        if self.has_backbone_mla:
             from .qwen3_dspark_mla import Qwen3DSparkMLAModel
 
             model_cls = Qwen3DSparkMLAModel
-        elif (getattr(self.config, "dflash_config", {}) or {}).get(
-            "markov_head_type"
-        ) == "mla":
+        elif self.has_markov_mla:
             raise ValueError("Markov MLA currently requires an MLA backbone")
         self.model = model_cls(
             vllm_config=vllm_config,
@@ -408,7 +413,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
                 "d2t mapping so sampled draft ids can be converted to target ids."
             )
 
-        if self.has_markov_mla:
+        if self.has_backbone_mla:
             required = set()
             for name, _ in self.model.named_parameters():
                 if name.startswith(("embed_tokens.", "mask_embedding")):

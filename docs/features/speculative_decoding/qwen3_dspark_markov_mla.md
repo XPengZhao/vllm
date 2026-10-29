@@ -2,8 +2,10 @@
 
 This adapter loads the SpecForge `codex/dspark-v1.5-markov-mla` export.
 It selects the MLA implementation when `draft_attention_type` is `mla` and
-requires `dflash_config.markov_head_type` to be `mla`. Backbone and Markov
-projection dimensions are read from the exported config. Missing trainable
+uses an MLA head only when `dflash_config.markov_head_type` is `mla`.
+Backbone-only MLA exports with `markov_head_type: vanilla` use the original
+`W1(previous token) -> W2` head, including older offline SpecForge exports.
+Backbone and Markov projection dimensions are read from the exported config. Missing trainable
 weights are errors; the frozen embedding and LM head may be shared with Qwen3.
 
 ## Execution
@@ -18,6 +20,12 @@ features. Expanded K/V tensors use vLLM's paged caches; compressed latent
 caching is not implemented. With 32 heads, width 128, BF16, and six attention
 modules, draft KV uses 98,304 bytes per cached token before allocator padding
 and overhead (about 384 MiB for 4,096 tokens in one request).
+
+For backbone-only MLA, only the five backbone caches are allocated and
+updated: 81,920 bytes per cached token (320 MiB for 4,096 tokens). The vanilla
+head has no KV cache or attention metadata; sequential sampling and CUDA Graph
+capture use the original Markov path. The same serving command applies with
+the backbone-only checkpoint path, without changing its exported head type.
 
 The backbone inserts its query block into its cache. The head only reads its
 own target-feature cache, with visible length equal to the anchor position.
