@@ -216,16 +216,29 @@ class Qwen3DSparkModel(DFlashQwen3Model):
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )
-        self.markov_head = DSparkMarkovHead(
-            config.vocab_size,
-            draft_vocab_size,
-            config.markov_rank,
-            prefix=maybe_prefix(prefix, "markov_head"),
-            quant_config=self.quant_config,
-            retain_weight_for_gather=(
-                getattr(config, "dspark_draft_topk", None) is not None
-            ),
-        )
+        if getattr(config, "markov_head_type", "low_rank") == "mla":
+            from vllm.config import get_current_vllm_config
+
+            from .qwen3_dspark_mla import Qwen3MarkovMLA
+
+            self.markov_head = Qwen3MarkovMLA(
+                config,
+                get_current_vllm_config().cache_config,
+                maybe_prefix(
+                    prefix, f"layers.{start_layer_id + len(self.layers)}.markov_head"
+                ),
+            )
+        else:
+            self.markov_head = DSparkMarkovHead(
+                config.vocab_size,
+                draft_vocab_size,
+                config.markov_rank,
+                prefix=maybe_prefix(prefix, "markov_head"),
+                quant_config=self.quant_config,
+                retain_weight_for_gather=(
+                    getattr(config, "dspark_draft_topk", None) is not None
+                ),
+            )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", False):
             with_markov = getattr(config, "confidence_head_with_markov", False)
@@ -250,7 +263,19 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
-        self.model = Qwen3DSparkModel(
+        model_cls = Qwen3DSparkModel
+        self.has_markov_mla = (
+            getattr(self.config, "draft_attention_type", None) == "mla"
+        )
+        if self.has_markov_mla:
+            from .qwen3_dspark_mla import Qwen3DSparkMLAModel
+
+            model_cls = Qwen3DSparkMLAModel
+        elif (getattr(self.config, "dflash_config", {}) or {}).get(
+            "markov_head_type"
+        ) == "mla":
+            raise ValueError("Markov MLA currently requires an MLA backbone")
+        self.model = model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
@@ -278,7 +303,16 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             self.draft_id_to_target_id = None
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
-        return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+        names = [layer.self_attn.attn.layer_name for layer in self.model.layers]
+        if self.has_markov_mla:
+            names.append(self.model.markov_head.attn.layer_name)
+        return names
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        causal = super().get_draft_attn_causal()
+        if self.has_markov_mla:
+            causal.append(False)
+        return causal
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Draft-vocab logits without the d2t scatter: the speculator adds the
@@ -294,7 +328,15 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.embed(token_ids)
 
-    def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+    def markov_bias(
+        self, markov_embed: torch.Tensor, positions: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.has_markov_mla:
+            if positions is None:
+                raise ValueError("Markov MLA requires query positions")
+            return self.model.markov_head.bias(
+                markov_embed, positions, self.logits_processor
+            )
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
     def apply_markov_bias_gathered(
@@ -365,6 +407,22 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
                 "Reduced-vocabulary Qwen3 DSpark checkpoints must include a "
                 "d2t mapping so sampled draft ids can be converted to target ids."
             )
+
+        if self.has_markov_mla:
+            required = set()
+            for name, _ in self.model.named_parameters():
+                if name.startswith(("embed_tokens.", "mask_embedding")):
+                    continue
+                if ".gate_up_proj." in name:
+                    required.add(
+                        "model." + name.replace(".gate_up_proj.", ".gate_proj.")
+                    )
+                    required.add("model." + name.replace(".gate_up_proj.", ".up_proj."))
+                else:
+                    required.add("model." + name)
+            missing = required - model_weights.keys()
+            if missing:
+                raise ValueError(f"Incomplete Qwen3 MLA checkpoint: {sorted(missing)}")
 
         orig_to_new_substr = {"mask_embedding": None}
         if not includes_embed_tokens:

@@ -29,6 +29,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -79,6 +80,9 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_model_config.hf_config, "dspark_draft_topk", None
         )
 
+        self._markov_query_start_loc = torch.arange(
+            self.max_num_reqs + 1, dtype=torch.int32, device=device
+        )
         self.use_confidence_head: bool = False
 
     def load_draft_model(
@@ -181,7 +185,15 @@ class DSparkSpeculator(DFlashSpeculator):
             markov_embed = self.model.markov_embed(prev)
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
-            bias = self.model.markov_bias(markov_embed)
+            if getattr(self.model, "has_markov_mla", False):
+                query_positions = (sample_pos[:, i] - 1).clamp(
+                    min=0, max=self.max_model_len - 1
+                )
+                bias = self.model.markov_bias(markov_embed, query_positions)
+                # A zero-length prefix contributes no transition bias.
+                bias = torch.where((sample_pos[:, 0] > 1)[:, None], bias, 0)
+            else:
+                bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
             draft_sampled_i = self._sample_logits(
                 logits_i, idx_map[:, i], sample_pos[:, i], i
@@ -265,4 +277,35 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        self._sample_sequential(num_reqs, head_hidden)
+        if not getattr(self.model, "has_markov_mla", False):
+            self._sample_sequential(num_reqs, head_hidden)
+            return
+
+        from vllm.model_executor.models.qwen3_dspark_mla import (
+            markov_attention_metadata,
+        )
+
+        layer_name = self.model.model.markov_head.attn.layer_name
+        head_metadata = None
+        if attn_metadata is not None:
+            anchors = self.input_buffers.positions[self._anchor_idx[:num_reqs]]
+            anchors = torch.where(
+                self.input_buffers.seq_lens[:num_reqs] > 0, anchors, 0
+            )
+            head_metadata = {
+                layer_name: markov_attention_metadata(
+                    attn_metadata[layer_name],
+                    num_reqs,
+                    self._markov_query_start_loc,
+                    anchors,
+                )
+            }
+        with set_forward_context(
+            head_metadata,
+            self.vllm_config,
+            num_tokens=num_reqs,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=slot_mappings,
+        ):
+            self._sample_sequential(num_reqs, head_hidden)

@@ -369,3 +369,181 @@ def test_k3_dspark_mla_kv_cache_spec_groups_with_target_mla():
     groups = _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
     assert len(groups) == 1
     assert len(groups[0].layer_names) == 29
+
+
+@pytest.fixture
+def qwen_mla_module():
+    from vllm.model_executor.models import qwen3_dspark_mla
+
+    return qwen3_dspark_mla
+
+
+def _small_qwen_mla(module, query_width):
+    """Exercise projection math independently of distributed initialization."""
+
+    class Rotary(nn.Module):
+        def forward(self, positions, query, key):
+            shape = query.shape
+            query = query.view(len(positions), -1, 2)
+            angle = positions.float()[:, None, None]
+            rotated = torch.stack((-query[..., 1], query[..., 0]), dim=-1)
+            return (query * angle.cos() + rotated * angle.sin()).view(shape), key
+
+    torch.manual_seed(42)
+    attention = module.Qwen3DSparkMLA.__new__(module.Qwen3DSparkMLA)
+    nn.Module.__init__(attention)
+    attention.num_heads = 2
+    attention.rank = 3
+    attention.nope_dim = attention.rope_dim = 2
+    attention.head_dim = attention.v_dim = 4
+    attention.q_proj = nn.Linear(query_width, 8, bias=False)
+    attention.kv_a_proj = nn.Linear(6, 5, bias=False)
+    attention.kv_a_norm = nn.RMSNorm(3, eps=1e-6)
+    attention.kv_a_norm.weight.data.copy_(torch.tensor([0.7, 1.0, 1.3]))
+    attention.kv_b_proj = nn.Linear(3, 12, bias=False)
+    attention.o_proj = nn.Linear(8, query_width, bias=False)
+    attention.rotary_emb = Rotary()
+    return attention
+
+
+@pytest.mark.parametrize("query_width", [3, 6])
+def test_qwen_mla_projects_shared_rope_and_normalized_latent(
+    qwen_mla_module, query_width
+):
+    """Backbone/head must match the training formula, including latent norm."""
+    attention = _small_qwen_mla(qwen_mla_module, query_width)
+    context = torch.randn(4, 6)
+    hidden = torch.randn(4, query_width)
+    positions = torch.tensor([0, 3, 7, 11])
+    query = attention.project_query(positions, hidden)
+    key, value = attention.project_kv(positions, context)
+
+    def rotate(x):
+        angle = positions.float()[:, None]
+        while angle.ndim < x.ndim:
+            angle = angle.unsqueeze(-1)
+        return x * angle.cos() + torch.stack((-x[..., 1], x[..., 0]), -1) * angle.sin()
+
+    raw_q = torch.nn.functional.linear(hidden, attention.q_proj.weight).view(4, 2, 4)
+    raw_kv = torch.nn.functional.linear(context, attention.kv_a_proj.weight)
+    latent = raw_kv[:, :3]
+    latent = latent * torch.rsqrt(latent.square().mean(-1, keepdim=True) + 1e-6)
+    latent = latent * attention.kv_a_norm.weight
+    expanded = torch.nn.functional.linear(latent, attention.kv_b_proj.weight)
+    expanded = expanded.view(4, 2, 6)
+    expected_q = torch.cat((raw_q[..., :2], rotate(raw_q[..., 2:])), -1)
+    expected_k = torch.cat(
+        (expanded[..., :2], rotate(raw_kv[:, 3:])[:, None].expand(-1, 2, -1)), -1
+    )
+    torch.testing.assert_close(query, expected_q)
+    torch.testing.assert_close(key, expected_k)
+    torch.testing.assert_close(value, expanded[..., 2:])
+    # Chunking the accepted context cannot change its cached projection.
+    chunks = [
+        attention.project_kv(positions[s], context[s])
+        for s in (slice(0, 2), slice(2, 4))
+    ]
+    torch.testing.assert_close(key, torch.cat([chunk[0] for chunk in chunks]))
+    torch.testing.assert_close(value, torch.cat([chunk[1] for chunk in chunks]))
+
+
+def test_qwen_markov_mla_reads_cache_without_residual(qwen_mla_module):
+    attention = _small_qwen_mla(qwen_mla_module, 3)
+    embedding = torch.randn(2, 3)
+    positions = torch.tensor([4, 9])
+    attention.markov_w2 = nn.Linear(3, 16, bias=False)
+    cached_output = torch.randn(2, 8)
+
+    class CachedAttention(nn.Module):
+        def forward(self, query, key, value):
+            assert key is None and value is None
+            torch.testing.assert_close(
+                query, attention.project_query(positions, embedding).flatten(1)
+            )
+            return cached_output
+
+    attention.attn = CachedAttention()
+    actual = qwen_mla_module.Qwen3MarkovMLA.bias(
+        attention, embedding, positions, lambda head, x: head(x)
+    )
+    expected = attention.markov_w2(attention.o_proj(cached_output))
+    torch.testing.assert_close(actual, expected)
+
+
+def test_qwen_markov_metadata_excludes_anchor_and_padded_requests(qwen_mla_module):
+    metadata = qwen_mla_module.FlashAttentionMetadata(
+        num_actual_tokens=6,
+        max_query_len=3,
+        query_start_loc=torch.tensor([0, 3, 6], dtype=torch.int32),
+        max_seq_len=20,
+        seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+        block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        slot_mapping=torch.arange(6),
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+    )
+    result = qwen_mla_module.markov_attention_metadata(
+        metadata, 2, torch.arange(3, dtype=torch.int32), torch.tensor([7, 0])
+    )
+    assert result.seq_lens.tolist() == [7, 0]
+    assert result.query_start_loc.tolist() == [0, 1, 2]
+    assert result.max_query_len == 1 and result.num_actual_tokens == 2
+    assert not result.causal
+    assert result.scheduler_metadata is None
+    torch.testing.assert_close(result.block_table, metadata.block_table)
+    assert metadata.seq_lens.tolist() == [10, 20]
+
+
+@pytest.fixture
+def qwen_speculator_class():
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    return DSparkSpeculator
+
+
+def test_qwen_markov_sampling_uses_previous_token_and_raw_confidence_embedding(
+    qwen_speculator_class,
+):
+    speculator = qwen_speculator_class.__new__(qwen_speculator_class)
+    speculator._draft_topk = None
+    speculator.num_speculative_steps = 2
+    speculator.max_model_len = 32
+    speculator.sample_indices = torch.arange(4)
+    speculator.sample_idx_mapping = torch.tensor([0, 0, -1, -1])
+    speculator.sample_pos = torch.tensor([6, 7, 0, 0])
+    speculator.input_buffers = SimpleNamespace(input_ids=torch.tensor([3, 0, 0, 0]))
+    speculator._anchor_idx = torch.tensor([0, 2])
+    speculator.use_confidence_head = True
+    speculator.draft_tokens = torch.zeros(2, 2, dtype=torch.long)
+    speculator.draft_token_confidence_probs = torch.zeros(2, 2)
+    calls = []
+    confidence_inputs = []
+
+    def bias(embedding, positions):
+        calls.append((embedding.clone(), positions.clone()))
+        logits = torch.zeros(2, 8)
+        logits[:, len(calls)] = 5
+        return logits
+
+    def confidence(hidden, embedding):
+        confidence_inputs.append(embedding.clone())
+        return torch.ones(4)
+
+    speculator.model = SimpleNamespace(
+        has_markov_mla=True,
+        compute_draft_logits=lambda hidden: torch.zeros(4, 8),
+        markov_embed=lambda ids: ids.float()[:, None].expand(-1, 3),
+        markov_bias=bias,
+        compute_confidence=confidence,
+    )
+    speculator._sample_logits = lambda logits, *args: logits.argmax(-1)
+    speculator._sample_sequential(2, torch.zeros(4, 6))
+    assert speculator.draft_tokens.tolist() == [[1, 2], [0, 0]]
+    assert calls[0][1].tolist() == [5, 0]
+    assert calls[1][1].tolist() == [6, 0]
+    assert calls[0][0][:, 0].tolist() == [3, 0]
+    assert calls[1][0][:, 0].tolist() == [1, 0]
+    assert confidence_inputs[0][:, 0].tolist() == [3, 1, 0, 0]

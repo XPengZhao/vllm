@@ -17,6 +17,14 @@ def _resolve_dspark_attention_backend(
     draft_backend: AttentionBackendEnum | None,
     target_backend: AttentionBackendEnum | None,
 ) -> AttentionBackendEnum | None:
+    hf_config = draft_model_config.hf_config
+    if (
+        hf_config.model_type == "qwen3"
+        and getattr(hf_config, "draft_attention_type", None) == "mla"
+    ):
+        if draft_backend not in (None, AttentionBackendEnum.FLASH_ATTN):
+            raise ValueError("Qwen3 DSpark MLA requires FLASH_ATTN")
+        return AttentionBackendEnum.FLASH_ATTN
     if draft_backend is not None:
         return draft_backend
     # DeepSeek-V4(.1) draft layers share the target's KV-cache layout. Other
