@@ -185,7 +185,7 @@ class DSparkSpeculator(DFlashSpeculator):
             markov_embed = self.model.markov_embed(prev)
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
-            if getattr(self.model, "has_markov_mla", False):
+            if getattr(self.model, "has_markov_attention", False):
                 query_positions = (sample_pos[:, i] - 1).clamp(
                     min=0, max=self.max_model_len - 1
                 )
@@ -277,7 +277,7 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        if not getattr(self.model, "has_markov_mla", False):
+        if not getattr(self.model, "has_markov_attention", False):
             self._sample_sequential(num_reqs, head_hidden)
             return
 

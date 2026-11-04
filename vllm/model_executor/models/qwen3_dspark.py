@@ -16,6 +16,7 @@ DSparkMarkovHead and DSparkConfidenceHead are shared with the DSV4-style DSpark 
 """
 
 from collections.abc import Iterable
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -38,6 +39,7 @@ from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
+    get_draft_quant_config,
     maybe_prefix,
     process_eagle_weight,
 )
@@ -192,6 +194,18 @@ class DSparkConfidenceHead(nn.Module):
 class Qwen3DSparkModel(DFlashQwen3Model):
     """DFlash Qwen3 backbone + DSpark Markov / confidence heads."""
 
+    # Only backbone projections are packed; the Markov Q and KV input widths differ.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr=DFlashQwen3Model.hf_to_vllm_mapper.orig_to_new_substr,
+        orig_to_new_stacked={
+            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
+            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
+            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        },
+    )
+
     def __init__(
         self,
         *,
@@ -228,6 +242,16 @@ class Qwen3DSparkModel(DFlashQwen3Model):
                     prefix, f"layers.{start_layer_id + len(self.layers)}.markov_head"
                 ),
             )
+        elif getattr(config, "markov_head_type", "low_rank") == "gqa":
+            from .qwen3_dspark_gqa import Qwen3MarkovGQA
+
+            self.markov_head = Qwen3MarkovGQA(
+                config,
+                vllm_config.cache_config,
+                maybe_prefix(
+                    prefix, f"layers.{start_layer_id + len(self.layers)}.markov_head"
+                ),
+            )
         else:
             self.markov_head = DSparkMarkovHead(
                 config.vocab_size,
@@ -252,6 +276,29 @@ class Qwen3DSparkModel(DFlashQwen3Model):
                 with_markov=with_markov,
             )
 
+    def precompute_and_store_context_kv(
+        self, context_states, context_positions, context_slot_mapping=None
+    ):
+        super().precompute_and_store_context_kv(
+            context_states, context_positions, context_slot_mapping
+        )
+        if getattr(self.config, "markov_head_type", "low_rank") != "gqa":
+            return
+        key, value = self.markov_head.project_kv(
+            context_positions, self.hidden_norm(context_states)
+        )
+        slots = (
+            context_slot_mapping[len(self.layers)]
+            if isinstance(context_slot_mapping, (list, tuple))
+            else context_slot_mapping
+        )
+        if slots is not None:
+            from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+
+            attn = self.markov_head.attn
+            impl = cast(FlashAttentionImpl, attn.impl)
+            impl.do_kv_cache_update(attn, key, value, attn.kv_cache, slots)
+
 
 class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -274,6 +321,21 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             )
             == "mla"
         )
+        self.has_markov_gqa = (
+            dspark_config.get(
+                "markov_head_type", getattr(self.config, "markov_head_type", "low_rank")
+            )
+            == "gqa"
+        )
+        self.has_markov_attention = self.has_markov_mla or self.has_markov_gqa
+        if self.has_markov_gqa:
+            from .qwen3_dspark_gqa import validate_markov_gqa_config
+
+            validate_markov_gqa_config(vllm_config, self.config)
+            if self.has_backbone_mla:
+                raise ValueError("Markov GQA currently requires a GQA backbone")
+            if get_draft_quant_config(vllm_config) is not None:
+                raise ValueError("Markov GQA requires unquantized draft weights")
         if self.has_backbone_mla:
             from .qwen3_dspark_mla import Qwen3DSparkMLAModel
 
@@ -309,13 +371,13 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         names = [layer.self_attn.attn.layer_name for layer in self.model.layers]
-        if self.has_markov_mla:
+        if self.has_markov_attention:
             names.append(self.model.markov_head.attn.layer_name)
         return names
 
     def get_draft_attn_causal(self) -> list[bool]:
         causal = super().get_draft_attn_causal()
-        if self.has_markov_mla:
+        if self.has_markov_attention:
             causal.append(False)
         return causal
 
@@ -336,9 +398,9 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
     def markov_bias(
         self, markov_embed: torch.Tensor, positions: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if self.has_markov_mla:
+        if self.has_markov_attention:
             if positions is None:
-                raise ValueError("Markov MLA requires query positions")
+                raise ValueError("Markov attention requires query positions")
             return self.model.markov_head.bias(
                 markov_embed, positions, self.logits_processor
             )
@@ -412,6 +474,15 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
                 "Reduced-vocabulary Qwen3 DSpark checkpoints must include a "
                 "d2t mapping so sampled draft ids can be converted to target ids."
             )
+
+        if self.has_markov_gqa:
+            required = {
+                "model.markov_head." + name
+                for name, _ in self.model.markov_head.named_parameters()
+            }
+            missing = required - model_weights.keys()
+            if missing:
+                raise ValueError(f"Incomplete Markov GQA checkpoint: {sorted(missing)}")
 
         if self.has_backbone_mla:
             required = set()

@@ -533,7 +533,7 @@ def test_qwen_markov_sampling_uses_previous_token_and_raw_confidence_embedding(
         return torch.ones(4)
 
     speculator.model = SimpleNamespace(
-        has_markov_mla=True,
+        has_markov_attention=True,
         compute_draft_logits=lambda hidden: torch.zeros(4, 8),
         markov_embed=lambda ids: ids.float()[:, None].expand(-1, 3),
         markov_bias=bias,
@@ -551,12 +551,23 @@ def test_qwen_markov_sampling_uses_previous_token_and_raw_confidence_embedding(
 
 @pytest.mark.parametrize(
     ("backbone", "head", "expected_mla"),
-    [("gqa", "vanilla", False), ("mla", "vanilla", False), ("mla", "mla", True)],
+    [
+        ("gqa", "vanilla", False),
+        ("mla", "vanilla", False),
+        ("mla", "mla", True),
+        ("gqa", "gqa", False),
+    ],
 )
 def test_qwen_backbone_and_markov_selection_are_independent(
     monkeypatch, qwen_mla_module, backbone, head, expected_mla
 ):
     from vllm.model_executor.models import qwen3_dspark as module
+    from vllm.model_executor.models import qwen3_dspark_gqa
+
+    monkeypatch.setattr(
+        qwen3_dspark_gqa, "validate_markov_gqa_config", lambda *args: None
+    )
+    monkeypatch.setattr(module, "get_draft_quant_config", lambda *args: None)
 
     class SelectedModel(Exception):
         pass
@@ -592,6 +603,7 @@ def test_qwen_backbone_and_markov_selection_are_independent(
         model.__init__(vllm_config=config)
     assert model.has_backbone_mla == (backbone == "mla")
     assert model.has_markov_mla == expected_mla
+    assert model.has_markov_attention == (head in {"mla", "gqa"})
 
 
 @pytest.mark.parametrize("mla_head", [False, True])
@@ -635,3 +647,211 @@ def test_qwen_context_updates_only_existing_attention_caches(qwen_mla_module, ml
         assert mapping is slots[i]
         torch.testing.assert_close(key, context * 2 + i)
         torch.testing.assert_close(value, context * 2 - i)
+
+
+@pytest.mark.parametrize("num_kv_heads", [2, 4], ids=["gqa", "mha"])
+def test_qwen_markov_gqa_matches_training_attention(num_kv_heads):
+    """Match training Q/K norm, RoPE, grouped heads and the residual-free head."""
+    from vllm.model_executor.models.qwen3_dspark_gqa import Qwen3MarkovGQA
+
+    torch.manual_seed(73)
+    head = Qwen3MarkovGQA.__new__(Qwen3MarkovGQA)
+    nn.Module.__init__(head)
+    head.num_heads, head.num_kv_heads, head.head_dim = 4, num_kv_heads, 4
+    head.q_proj = nn.Linear(3, 16, bias=False)
+    head.k_proj = nn.Linear(6, num_kv_heads * 4, bias=False)
+    head.v_proj = nn.Linear(6, num_kv_heads * 4, bias=False)
+    head.o_proj = nn.Linear(16, 3, bias=False)
+    head.markov_w2 = nn.Linear(3, 17, bias=False)
+    head.q_norm, head.k_norm = nn.RMSNorm(4, eps=1e-6), nn.RMSNorm(4, eps=1e-6)
+    head.q_norm.weight.data.copy_(torch.tensor([0.7, 1.1, 1.3, 0.9]))
+    head.k_norm.weight.data.copy_(torch.tensor([1.2, 0.6, 0.8, 1.4]))
+
+    def rotate(x, positions):
+        angles = positions[:, None, None] * torch.tensor([1.0, 0.01, 1.0, 0.01])
+        rotated = torch.cat((-x[..., 2:], x[..., :2]), -1)
+        return x * angles.cos() + rotated * angles.sin()
+
+    class Rotary(nn.Module):
+        def forward(self, positions, query, key):
+            return rotate(query.view(len(positions), -1, 4), positions).flatten(1), key
+
+    head.rotary_emb = Rotary()
+    context = torch.randn(7, 6)
+    positions = torch.arange(7)
+    key, value = head.project_kv(positions, context)
+
+    def norm(x, weight):
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6) * weight
+
+    expected_k = rotate(
+        norm(
+            (context @ head.k_proj.weight.T).view(7, num_kv_heads, 4),
+            head.k_norm.weight,
+        ),
+        positions,
+    )
+    expected_v = (context @ head.v_proj.weight.T).view(7, num_kv_heads, 4)
+    torch.testing.assert_close(key, expected_k)
+    torch.testing.assert_close(value, expected_v)
+    chunks = [
+        head.project_kv(positions[s], context[s]) for s in (slice(0, 3), slice(3, 7))
+    ]
+    torch.testing.assert_close(key, torch.cat([chunk[0] for chunk in chunks]))
+    torch.testing.assert_close(value, torch.cat([chunk[1] for chunk in chunks]))
+    cached_key, cached_value = key.clone(), value.clone()
+
+    class ReadOnlyCache(nn.Module):
+        def forward(self, query, k, v):
+            assert k is None and v is None
+            # Only the prefix before anchor=5 is visible, even at later steps.
+            return torch.nn.functional.scaled_dot_product_attention(
+                query.view(1, 4, 1, 4),
+                key[:5].transpose(0, 1)[None],
+                value[:5].transpose(0, 1)[None],
+                enable_gqa=True,
+            ).reshape(1, 16)
+
+    head.attn = ReadOnlyCache()
+    for step in range(3):
+        embedding = torch.randn(1, 3)
+        query_positions = torch.tensor([5 + step])
+        query = rotate(
+            norm((embedding @ head.q_proj.weight.T).view(1, 4, 4), head.q_norm.weight),
+            query_positions,
+        )[0]
+        k = expected_k[:5].repeat_interleave(4 // num_kv_heads, dim=1)
+        v = expected_v[:5].repeat_interleave(4 // num_kv_heads, dim=1)
+        scores = torch.einsum("hd,thd->ht", query, k) / 2
+        attended = torch.einsum("ht,thd->hd", scores.softmax(-1), v).reshape(1, 16)
+        expected = attended @ head.o_proj.weight.T @ head.markov_w2.weight.T
+        actual = head.bias(embedding, query_positions, lambda layer, x: layer(x))
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(key, cached_key)
+    torch.testing.assert_close(value, cached_value)
+
+
+def test_qwen_markov_gqa_weight_mapping_preserves_head_projections():
+    from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkModel
+
+    mapper = Qwen3DSparkModel.hf_to_vllm_mapper
+    for proj in ("q", "k", "v"):
+        name = f"markov_head.{proj}_proj.weight"
+        assert mapper._map_name_with_shard(name) == (name, None)
+        assert mapper._map_name_with_shard(
+            f"layers.0.self_attn.{proj}_proj.weight"
+        ) == ("layers.0.self_attn.qkv_proj.weight", proj)
+
+
+def test_qwen_markov_gqa_context_cache_is_separate(monkeypatch):
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+    from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkModel
+
+    backbone_calls, cache_calls = [], []
+    monkeypatch.setattr(
+        DFlashQwen3Model,
+        "precompute_and_store_context_kv",
+        lambda self, *args: backbone_calls.append(args),
+    )
+    model = Qwen3DSparkModel.__new__(Qwen3DSparkModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(markov_head_type="gqa")
+    model.layers = nn.ModuleList([nn.Identity() for _ in range(5)])
+    model.hidden_norm = lambda x: x * 2
+    model.markov_head = SimpleNamespace(
+        project_kv=lambda positions, context: (context + 1, context - 1),
+        attn=SimpleNamespace(
+            kv_cache="head",
+            impl=SimpleNamespace(
+                do_kv_cache_update=lambda *args: cache_calls.append(args)
+            ),
+        ),
+    )
+    context, positions = torch.randn(3, 6), torch.arange(3)
+    slots = [torch.arange(3) + i * 4 for i in range(6)]
+    model.precompute_and_store_context_kv(context, positions, slots)
+    assert len(backbone_calls) == len(cache_calls) == 1
+    assert backbone_calls[0][0] is context
+    assert cache_calls[0][3] == "head"
+    assert cache_calls[0][4] is slots[5]
+    torch.testing.assert_close(cache_calls[0][1], context * 2 + 1)
+    torch.testing.assert_close(cache_calls[0][2], context * 2 - 1)
+    model.precompute_and_store_context_kv(context, positions, None)
+    assert len(cache_calls) == 1
+
+
+def test_qwen_markov_gqa_rejects_missing_head_weights():
+    from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
+
+    model = Qwen3DSparkForCausalLM.__new__(Qwen3DSparkForCausalLM)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(vocab_size=16, draft_vocab_size=16)
+    model.target_vocab_size = 16
+    model.has_markov_gqa = True
+    model.has_backbone_mla = False
+    model.model = nn.Module()
+    model.model.markov_head = nn.Module()
+    model.model.markov_head.k_norm = nn.RMSNorm(4)
+    with pytest.raises(ValueError, match=r"markov_head.k_norm.weight"):
+        model.load_weights([])
+
+
+def test_qwen_markov_forward_refreshes_prefix_without_mutating_backbone(
+    monkeypatch, qwen_speculator_class, qwen_mla_module
+):
+    """Batch padding/anchor changes must not reuse the previous head prefix."""
+    from contextlib import contextmanager
+
+    from vllm.v1.worker.gpu.spec_decode.dspark import speculator as module
+
+    state = qwen_speculator_class.__new__(qwen_speculator_class)
+    state.model = SimpleNamespace(
+        has_markov_attention=True,
+        model=SimpleNamespace(
+            markov_head=SimpleNamespace(attn=SimpleNamespace(layer_name="head"))
+        ),
+    )
+    state.vllm_config = object()
+    state.input_buffers = SimpleNamespace(
+        positions=torch.tensor([5, 6, 9, 10]),
+        seq_lens=torch.tensor([7, 11]),
+    )
+    state._anchor_idx = torch.tensor([0, 2])
+    state._markov_query_start_loc = torch.arange(3, dtype=torch.int32)
+    metadata = qwen_mla_module.FlashAttentionMetadata(
+        num_actual_tokens=4,
+        max_query_len=2,
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        max_seq_len=32,
+        seq_lens=state.input_buffers.seq_lens,
+        block_table=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+        slot_mapping=torch.arange(4),
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+    )
+    seen = []
+
+    @contextmanager
+    def forward_context(head_metadata, *args, **kwargs):
+        head = head_metadata["head"]
+        seen.append(head.seq_lens.clone())
+        assert head.query_start_loc.tolist() == [0, 1, 2]
+        assert head.block_table.data_ptr() == metadata.block_table.data_ptr()
+        assert head.max_num_splits == 1 and head.scheduler_metadata is None
+        assert head.max_query_len == 1 and head.num_actual_tokens == 2
+        yield
+
+    monkeypatch.setattr(module, "set_forward_context", forward_context)
+    state._run_model = lambda *args: torch.zeros(4, 6)
+    state._sample_sequential = lambda *args: None
+    for anchors, seq_lens in (([5, 9], [7, 11]), ([12, 99], [14, 0])):
+        state.input_buffers.positions[state._anchor_idx] = torch.tensor(anchors)
+        state.input_buffers.seq_lens.copy_(torch.tensor(seq_lens))
+        state._generate_draft(2, 4, {"head": metadata}, None, None)
+        assert metadata.seq_lens.tolist() == seq_lens
+        assert metadata.query_start_loc.tolist() == [0, 2, 4]
+        assert metadata.max_query_len == 2
+    assert [x.tolist() for x in seen] == [[5, 9], [12, 0]]

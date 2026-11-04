@@ -238,7 +238,7 @@ class Qwen3DSparkMLAModel(Qwen3DSparkModel):
 def markov_attention_metadata(metadata, num_reqs, query_start_loc, anchor_positions):
     """One query per request, reading the same pre-anchor prefix at every step."""
     if not isinstance(metadata, FlashAttentionMetadata):
-        raise ValueError("Qwen3 Markov MLA requires the FlashAttention backend")
+        raise ValueError("Qwen3 Markov attention requires the FlashAttention backend")
     return replace(
         metadata,
         num_actual_tokens=num_reqs,
