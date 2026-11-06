@@ -59,6 +59,8 @@ def validate_markov_gqa_config(vllm_config, config):
 class Qwen3MarkovGQA(nn.Module):
     """W1 -> Q/K-normalized attention over target context -> O -> W2."""
 
+    options_key = "markov_gqa"
+
     def __init__(self, config, cache_config, prefix):
         super().__init__()
         head = DSparkMarkovHead(
@@ -66,7 +68,9 @@ class Qwen3MarkovGQA(nn.Module):
         )
         self.markov_w1 = head.markov_w1
         self.markov_w2 = head.markov_w2
-        options = (getattr(config, "dflash_config", None) or {}).get("markov_gqa", {})
+        options = (getattr(config, "dflash_config", None) or {}).get(
+            self.options_key, {}
+        )
         self.num_heads = options.get("num_attention_heads", config.num_attention_heads)
         self.num_kv_heads = options.get(
             "num_key_value_heads", config.num_key_value_heads

@@ -855,3 +855,69 @@ def test_qwen_markov_forward_refreshes_prefix_without_mutating_backbone(
         assert metadata.query_start_loc.tolist() == [0, 2, 4]
         assert metadata.max_query_len == 2
     assert [x.tolist() for x in seen] == [[5, 9], [12, 0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA FlashAttention")
+def test_qwen_token_history_incremental_bias_matches_dense(monkeypatch):
+    from vllm.model_executor.models import qwen3_dspark_token_attn as mod
+    from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+    b, heads, dim, width = 2, 8, 128, 7
+    device, dtype = "cuda", torch.bfloat16
+    lengths = [0, 21]
+    table = torch.tensor([[3, 1], [2, 4]], dtype=torch.int32, device=device)
+    cache = torch.randn(5, heads, 16, 2 * dim, device=device, dtype=dtype)
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+        max_seq_len=64,
+        query_start_loc=torch.arange(b + 1, dtype=torch.int32, device=device),
+        block_table=table,
+    )
+    monkeypatch.setattr(
+        mod, "get_forward_context", lambda: SimpleNamespace(attn_metadata={})
+    )
+    monkeypatch.setattr(
+        mod, "get_attention_context", lambda name: (meta, None, cache, None)
+    )
+    head = mod.Qwen3TokenHistoryAttention.__new__(mod.Qwen3TokenHistoryAttention)
+    nn.Module.__init__(head)
+    head.num_heads, head.head_dim = heads, dim
+    head.num_kv_heads = heads
+    head.attn = SimpleNamespace(
+        layer_name="head",
+        impl=SimpleNamespace(
+            vllm_flash_attn_version=get_flash_attn_version(head_size=dim)
+        ),
+    )
+    head.q_proj = nn.Linear(256, heads * dim, bias=False).to(device, dtype)
+    head.k_proj = nn.Linear(256, heads * dim, bias=False).to(device, dtype)
+    head.v_proj = nn.Linear(256, heads * dim, bias=False).to(device, dtype)
+    head.q_norm = nn.RMSNorm(dim).to(device, dtype)
+    head.k_norm = nn.RMSNorm(dim).to(device, dtype)
+    head.rotary_emb = lambda pos, x, _: (x, None)
+    head.o_proj = nn.Linear(heads * dim, 256, bias=False).to(device, dtype)
+    head.output_norm = mod.OutputNorm(256, 1e-6).to(device, dtype)
+    head.markov_w2 = nn.Linear(256, 32, bias=False).to(device, dtype)
+    embeddings = torch.randn(width, b, 256, device=device, dtype=dtype)
+    past_k: list[torch.Tensor] = []
+    past_v: list[torch.Tensor] = []
+    for step, e in enumerate(embeddings):
+        pos = meta.seq_lens + step
+        actual = head.step_bias(e, pos, past_k, past_v, lambda proj, x: proj(x))
+        expected = []
+        for i, n in enumerate(lengths):
+            indices = torch.arange(n, device=device)
+            packed = cache.transpose(1, 2)[table[i, indices // 16].long(), indices % 16]
+            hk, hv = packed.chunk(2, -1)
+            local = embeddings[: step + 1, i]
+            k = torch.cat((hk, head.k_norm(head.k_proj(local).reshape(-1, heads, dim))))
+            v = torch.cat((hv, head.v_proj(local).reshape(-1, heads, dim)))
+            q = head.q_norm(head.q_proj(e[i]).reshape(heads, dim))
+            scores = torch.einsum("hd,khd->hk", q.float(), k.float()) * dim**-0.5
+            out = torch.einsum("hk,khd->hd", scores.softmax(-1), v.float()).to(dtype)
+            expected.append(
+                head.markov_w2(head.output_norm(e[i] + head.o_proj(out.flatten())))
+            )
+        torch.testing.assert_close(
+            actual, torch.stack(expected), atol=0.025, rtol=0.025
+        )

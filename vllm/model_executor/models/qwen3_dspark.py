@@ -242,6 +242,16 @@ class Qwen3DSparkModel(DFlashQwen3Model):
                     prefix, f"layers.{start_layer_id + len(self.layers)}.markov_head"
                 ),
             )
+        elif getattr(config, "markov_head_type", None) == "token_attention":
+            from .qwen3_dspark_token_attn import Qwen3TokenHistoryAttention
+
+            self.markov_head = Qwen3TokenHistoryAttention(
+                config,
+                vllm_config.cache_config,
+                maybe_prefix(
+                    prefix, f"layers.{start_layer_id + len(self.layers)}.markov_head"
+                ),
+            )
         elif getattr(config, "markov_head_type", "low_rank") == "gqa":
             from .qwen3_dspark_gqa import Qwen3MarkovGQA
 
@@ -327,8 +337,20 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             )
             == "gqa"
         )
-        self.has_markov_attention = self.has_markov_mla or self.has_markov_gqa
-        if self.has_markov_gqa:
+        self.has_token_history = (
+            dspark_config.get("markov_head_type") == "token_attention"
+        )
+        self.has_markov_attention = (
+            self.has_markov_mla or self.has_markov_gqa or self.has_token_history
+        )
+        if (
+            self.has_token_history
+            and speculative_config.num_speculative_tokens != self.config.block_size
+        ):
+            raise ValueError(
+                "Token-history DSpark requires the trained draft block width"
+            )
+        if self.has_markov_gqa or self.has_token_history:
             from .qwen3_dspark_gqa import validate_markov_gqa_config
 
             validate_markov_gqa_config(vllm_config, self.config)
@@ -475,7 +497,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
                 "d2t mapping so sampled draft ids can be converted to target ids."
             )
 
-        if self.has_markov_gqa:
+        if self.has_markov_gqa or self.has_token_history:
             required = {
                 "model.markov_head." + name
                 for name, _ in self.model.markov_head.named_parameters()

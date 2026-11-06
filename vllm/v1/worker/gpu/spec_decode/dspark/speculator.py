@@ -84,6 +84,30 @@ class DSparkSpeculator(DFlashSpeculator):
             self.max_num_reqs + 1, dtype=torch.int32, device=device
         )
         self.use_confidence_head: bool = False
+        cfg = self.draft_model_config.hf_config
+        self.context_token_ids = (
+            torch.zeros(self.max_num_tokens, device=device, dtype=torch.long)
+            if (getattr(cfg, "dflash_config", None) or {}).get("markov_head_type")
+            == "token_attention"
+            else None
+        )
+
+    def prepare_context_anchor(self, input_batch, num_rejected):
+        if self.context_token_ids is not None:
+            count = input_batch.num_tokens
+            self.context_token_ids[:count].copy_(input_batch.input_ids[:count])
+
+    def _precompute_context_kv(self, start, end, dummy_run=False):
+        super()._precompute_context_kv(start, end, dummy_run)
+        if self.context_token_ids is not None and not dummy_run:
+            assert self._layer_group_idx is not None
+            # Head follows all backbone layers. Use its own group's physical slots.
+            slots = self._context_slot_mappings[self._layer_group_idx[-1], start:end]
+            self.model.model.markov_head.store_prefix(
+                self.context_token_ids[start:end],
+                self.context_positions[start:end],
+                slots,
+            )
 
     def load_draft_model(
         self,
@@ -174,6 +198,8 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        local_keys: list[torch.Tensor] = []
+        local_values: list[torch.Tensor] = []
         confidence_markov_embeds = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,
@@ -189,9 +215,18 @@ class DSparkSpeculator(DFlashSpeculator):
                 query_positions = (sample_pos[:, i] - 1).clamp(
                     min=0, max=self.max_model_len - 1
                 )
-                bias = self.model.markov_bias(markov_embed, query_positions)
-                # A zero-length prefix contributes no transition bias.
-                bias = torch.where((sample_pos[:, 0] > 1)[:, None], bias, 0)
+                if getattr(self.model, "has_token_history", False):
+                    bias = self.model.model.markov_head.step_bias(
+                        markov_embed,
+                        query_positions,
+                        local_keys,
+                        local_values,
+                        self.model.logits_processor,
+                    )
+                else:
+                    bias = self.model.markov_bias(markov_embed, query_positions)
+                    # A zero-length target-feature prefix contributes no bias.
+                    bias = torch.where((sample_pos[:, 0] > 1)[:, None], bias, 0)
             else:
                 bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
