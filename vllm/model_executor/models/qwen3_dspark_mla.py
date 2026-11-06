@@ -8,7 +8,9 @@ import torch
 from torch import nn
 
 from vllm.config import get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -84,6 +86,14 @@ class Qwen3DSparkMLA(nn.Module):
             rope_parameters=config.rope_parameters,
         )
         self.causal = False
+        self.context_window = (
+            None if markov else getattr(config, "dspark_context_window", None)
+        )
+        if self.context_window is not None:
+            if type(self.context_window) is not int or self.context_window < 1:
+                raise ValueError("dspark_context_window must be a positive integer")
+            if self.head_dim != 128:
+                raise ValueError("Qwen3 DSpark anchor-window MLA requires head_dim=128")
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -113,6 +123,18 @@ class Qwen3DSparkMLA(nn.Module):
     def forward(self, positions, hidden_states):
         query = self.project_query(positions, hidden_states)
         key, value = self.project_kv(positions, hidden_states)
+        if self.context_window is not None:
+            from .qwen3_dspark_swa import anchor_window_attention
+
+            if get_forward_context().attn_metadata is None:
+                # Memory profiling before the paged cache is allocated.
+                output = torch.zeros_like(query)
+            else:
+                metadata, _, cache, _ = get_attention_context(self.attn.layer_name)
+                output = anchor_window_attention(
+                    query, key, value, cache, metadata, positions, self.context_window
+                )
+            return self.o_proj(output.flatten(1))
         return self.o_proj(self.attn(query.flatten(1), key, value))
 
 

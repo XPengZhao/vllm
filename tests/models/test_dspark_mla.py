@@ -635,3 +635,40 @@ def test_qwen_context_updates_only_existing_attention_caches(qwen_mla_module, ml
         assert mapping is slots[i]
         torch.testing.assert_close(key, context * 2 + i)
         torch.testing.assert_close(value, context * 2 - i)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA paged attention")
+@pytest.mark.parametrize("window", [1, 128, 512, 1024])
+def test_qwen_mla_anchor_window_matches_training_mask(window):
+    from vllm.model_executor.models.qwen3_dspark_swa import anchor_window_attention
+
+    # Two requests with different anchors, non-contiguous pages, and a padded row.
+    dev = "cuda"
+    dtype = torch.bfloat16
+    page, heads, dim, width = 16, 2, 128, 7
+    anchors = (3, 1051)
+    blocks = 67
+    table = torch.randperm(2 * blocks, device=dev).reshape(2, blocks)
+    table = torch.cat((table, torch.zeros_like(table[:1]))).int()
+    cache = torch.randn(2 * blocks, heads, page, 2 * dim, device=dev, dtype=dtype)
+    q, k, v = torch.randn(3, 3 * width, heads, dim, device=dev, dtype=dtype)
+    positions = torch.cat([torch.arange(width, device=dev) + a for a in (*anchors, 0)])
+    metadata = SimpleNamespace(
+        block_table=table,
+        max_query_len=width,
+        query_start_loc=torch.tensor([0, width, 2 * width, 2 * width], device=dev),
+    )
+    out = anchor_window_attention(q, k, v, cache, metadata, positions, window)
+    expected = torch.zeros_like(out)
+    for i, a in enumerate(anchors):
+        rows = slice(i * width, (i + 1) * width)
+        # Reference reads all historical positions and applies the training mask.
+        pos = torch.arange(a, device=dev)
+        history = cache.transpose(1, 2)[table[i, pos // page].long(), pos % page]
+        hk, hv = history.chunk(2, dim=-1)
+        keys = torch.cat((hk, k[rows])).float()
+        values = torch.cat((hv, v[rows])).float()
+        scores = torch.einsum("qhd,khd->hqk", q[rows].float(), keys) * dim**-0.5
+        scores[:, :, : max(0, a - window + 1)] = -torch.inf
+        expected[rows] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), values)
+    torch.testing.assert_close(out, expected, atol=0.015, rtol=0.015)

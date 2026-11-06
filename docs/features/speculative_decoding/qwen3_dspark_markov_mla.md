@@ -88,3 +88,17 @@ reuse. Run the existing DSpark GSM8K evaluation with the trained checkpoint;
 record accuracy, acceptance length/rate, throughput and peak memory against
 `dspark-v1.4` using the same prompts, sampling and hardware. There is no measured
 acceptance or performance result for this adapter yet.
+
+### SpecForge Qwen3-4B MLA window ablation
+
+Export the trained checkpoint using its original draft config. Check that the
+exported config contains `draft_attention_type: "mla"` and the original
+`dspark_context_window` (128, 512, or 1024). Serve the exported directory with
+the backbone-only MLA settings above. The model reads the window from the HF
+config and uses the same learned parameters as the full-history MLA model.
+
+For anchor `a` and window `W`, each draft query attends to history positions
+`max(0, a-W+1) <= j < a` and the entire current block. The implementation reads
+history from ordinary full-sized paged cache allocations and uses the live
+per-layer block K/V directly. The window limits attention reads; cache capacity
+still scales with the full sequence length.
