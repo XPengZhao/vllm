@@ -84,13 +84,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.max_num_reqs + 1, dtype=torch.int32, device=device
         )
         self.use_confidence_head: bool = False
-        cfg = self.draft_model_config.hf_config
-        self.context_token_ids = (
-            torch.zeros(self.max_num_tokens, device=device, dtype=torch.long)
-            if (getattr(cfg, "dflash_config", None) or {}).get("markov_head_type")
-            == "token_attention"
-            else None
-        )
+        self.context_token_ids: torch.Tensor | None = None
 
     def prepare_context_anchor(self, input_batch, num_rejected):
         if self.context_token_ids is not None:
@@ -115,6 +109,10 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        if getattr(model, "has_token_history", False):
+            self.context_token_ids = torch.zeros(
+                self.max_num_tokens, dtype=torch.long, device=self.device
+            )
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.

@@ -921,3 +921,29 @@ def test_qwen_token_history_incremental_bias_matches_dense(monkeypatch):
         torch.testing.assert_close(
             actual, torch.stack(expected), atol=0.025, rtol=0.025
         )
+
+    @torch.no_grad()
+    def proposal():
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        return torch.stack(
+            [
+                head.step_bias(
+                    e, meta.seq_lens + step, keys, values, lambda proj, x: proj(x)
+                )
+                for step, e in enumerate(embeddings)
+            ]
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    proposal()
+    with torch.cuda.graph(graph):
+        captured = proposal()
+    # Reuse a captured batch with new input tokens, request pages, and lengths.
+    # Fresh eager proposals have no previous block's local keys.
+    for new_lengths in ([18, 0], [1, 24]):
+        embeddings.normal_()
+        table.copy_(table.flip(0))
+        meta.seq_lens.copy_(meta.seq_lens.new_tensor(new_lengths))
+        graph.replay()
+        torch.testing.assert_close(captured, proposal(), atol=0.005, rtol=0.005)

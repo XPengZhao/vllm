@@ -325,21 +325,12 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             getattr(self.config, "draft_attention_type", None) == "mla"
         )
         dspark_config = getattr(self.config, "dflash_config", None) or {}
-        self.has_markov_mla = (
-            dspark_config.get(
-                "markov_head_type", getattr(self.config, "markov_head_type", "low_rank")
-            )
-            == "mla"
+        head_type = dspark_config.get(
+            "markov_head_type", getattr(self.config, "markov_head_type", "low_rank")
         )
-        self.has_markov_gqa = (
-            dspark_config.get(
-                "markov_head_type", getattr(self.config, "markov_head_type", "low_rank")
-            )
-            == "gqa"
-        )
-        self.has_token_history = (
-            dspark_config.get("markov_head_type") == "token_attention"
-        )
+        self.has_markov_mla = head_type == "mla"
+        self.has_markov_gqa = head_type == "gqa"
+        self.has_token_history = head_type == "token_attention"
         self.has_markov_attention = (
             self.has_markov_mla or self.has_markov_gqa or self.has_token_history
         )
