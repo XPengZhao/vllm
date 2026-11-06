@@ -205,6 +205,14 @@ class Qwen3DSparkMLAModel(Qwen3DSparkModel):
         if get_draft_quant_config(vllm_config) is not None:
             raise ValueError("Qwen3 DSpark MLA does not support quantized projections")
         hf = config.hf_config
+        if getattr(hf, "dspark_context_window", None) is not None:
+            trained_width = getattr(hf, "block_size", None)
+            draft_width = vllm_config.speculative_config.num_speculative_tokens
+            if draft_width != trained_width:
+                raise ValueError(
+                    f"Qwen3 DSpark MLA SWA requires num_speculative_tokens "
+                    f"({draft_width}) to match block_size ({trained_width})"
+                )
         if (
             getattr(hf, "is_causal", False)
             or getattr(hf, "use_sliding_window", False)

@@ -672,3 +672,23 @@ def test_qwen_mla_anchor_window_matches_training_mask(window):
         scores[:, :, : max(0, a - window + 1)] = -torch.inf
         expected[rows] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), values)
     torch.testing.assert_close(out, expected, atol=0.015, rtol=0.015)
+
+    if window == 128:
+        # The real capture uses dummy positions, followed by live page tables
+        # and a different number of requests on each replay.
+        positions.zero_()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = anchor_window_attention(
+                q, k, v, cache, metadata, positions, window
+            )
+        for n in (1, 2):
+            table[:2].copy_(table[:2].flip(0))
+            positions[:width].copy_(torch.arange(width, device=dev) + 150 + n)
+            positions[width : 2 * width].copy_(torch.arange(width, device=dev) + 61)
+            metadata.query_start_loc.copy_(
+                torch.tensor([0, width, n * width, n * width], device=dev)
+            )
+            graph.replay()
+            eager = anchor_window_attention(q, k, v, cache, metadata, positions, window)
+            torch.testing.assert_close(captured, eager, rtol=0, atol=0)
