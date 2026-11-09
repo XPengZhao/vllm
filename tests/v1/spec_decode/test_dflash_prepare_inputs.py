@@ -26,11 +26,12 @@ def _run_prepare(
     cp_size: int = 1,
     cp_interleave: int = 1,
     draft_dcp_size: int | None = None,
+    sample_from_anchor: bool = True,
+    num_speculative_steps: int = 3,
 ):
     device = torch.device("cuda")
     max_num_reqs = 4
     max_num_tokens = 16
-    num_speculative_steps = 3
 
     input_buffers = SimpleNamespace(
         input_ids=torch.full((max_num_tokens,), -1, dtype=torch.int32, device=device),
@@ -109,12 +110,12 @@ def _run_prepare(
         ),
         dcp_size=cp_size if draft_dcp_size is None else draft_dcp_size,
         parallel_drafting_token_id=123,
-        num_query_per_req=num_speculative_steps,
+        num_query_per_req=num_speculative_steps + int(not sample_from_anchor),
         num_speculative_steps=num_speculative_steps,
         max_num_reqs=max_num_reqs,
         max_num_tokens=max_num_tokens,
         max_model_len=128,
-        sample_from_anchor=True,
+        sample_from_anchor=sample_from_anchor,
     )
     with (
         patch(
@@ -212,3 +213,16 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+def test_dspark_mask_layout_skips_anchor_after_partial_rejection():
+    out = _run_prepare(
+        target_positions=[10, 11, 12, 13],
+        block_table_values=[0, 0, 7, 8, 9, 10, 11, 12],
+        sample_from_anchor=False,
+        num_speculative_steps=7,
+    )
+    assert out.input_buffers.input_ids[:8].cpu().tolist() == [99] + [123] * 7
+    assert out.sample_indices[:7].tolist() == list(range(1, 8))
+    assert out.sample_pos[:7].tolist() == list(range(13, 20))
+    assert out.context_slot_mapping[:4].tolist() == [30, 31, PAD_SLOT_ID, PAD_SLOT_ID]

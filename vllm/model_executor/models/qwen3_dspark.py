@@ -344,7 +344,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         if self.has_markov_gqa or self.has_token_history:
             from .qwen3_dspark_gqa import validate_markov_gqa_config
 
-            validate_markov_gqa_config(vllm_config, self.config)
+            validate_markov_gqa_config(vllm_config, self.config, self.has_token_history)
             if self.has_backbone_mla:
                 raise ValueError("Markov GQA currently requires a GQA backbone")
             if get_draft_quant_config(vllm_config) is not None:

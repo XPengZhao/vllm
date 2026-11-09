@@ -15,7 +15,7 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from .qwen3_dspark import DSparkMarkovHead
 
 
-def validate_markov_gqa_config(vllm_config, config):
+def validate_markov_gqa_config(vllm_config, config, has_token_history=False):
     parallel = vllm_config.parallel_config
     if any(
         getattr(parallel, name) != 1
@@ -34,11 +34,12 @@ def validate_markov_gqa_config(vllm_config, config):
         raise ValueError("Markov GQA requires cache_dtype=auto")
     if (
         getattr(config, "dspark_draft_topk", None) is not None
-        or not getattr(config, "sample_from_anchor", True)
         or (getattr(config, "draft_vocab_size", None) or config.vocab_size)
         != config.vocab_size
     ):
-        raise ValueError("Markov GQA requires full-vocab anchor sampling without top-k")
+        raise ValueError("Markov GQA requires full-vocab sampling without top-k")
+    if not has_token_history and not getattr(config, "sample_from_anchor", True):
+        raise ValueError("Context-only Markov GQA requires anchor sampling")
     if (
         getattr(config, "attention_bias", False)
         or not getattr(config, "is_neox_style", True)
