@@ -692,3 +692,40 @@ def test_qwen_mla_anchor_window_matches_training_mask(window):
             graph.replay()
             eager = anchor_window_attention(q, k, v, cache, metadata, positions, window)
             torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA paged attention")
+def test_qwen_swa_compiled_profile_then_live_context(monkeypatch, qwen_mla_module):
+    ctx = SimpleNamespace(attn_metadata=None)
+    monkeypatch.setattr(qwen_mla_module, "get_forward_context", lambda: ctx)
+    table = torch.tensor([[1]], dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 7], dtype=torch.int32, device="cuda"),
+        max_query_len=7,
+        block_table=table,
+    )
+    cache = torch.zeros(2, 2, 16, 256, device="cuda", dtype=torch.bfloat16)
+    cache[1, :, :, 128:] = 8
+    monkeypatch.setattr(
+        qwen_mla_module,
+        "get_attention_context",
+        lambda _: (metadata, None, cache, None),
+    )
+    q = torch.zeros(7, 2, 128, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(7, device="cuda") + 7
+
+    def forward(q, positions):
+        return torch.ops.vllm.dspark_anchor_window_mla(q, q, q, positions, "head", 512)
+
+    graphs = []
+
+    def backend(graph, _):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(forward, backend=backend, fullgraph=True)
+    torch.testing.assert_close(compiled(q, positions), torch.zeros_like(q))
+    ctx.attn_metadata = {"head": metadata}
+    # Seven history values of eight and seven live zeros have equal scores.
+    torch.testing.assert_close(compiled(q, positions), torch.full_like(q, 4))
+    assert len(graphs) == 1

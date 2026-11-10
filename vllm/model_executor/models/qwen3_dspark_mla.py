@@ -15,6 +15,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.transformers_utils.config import set_default_rope_theta
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionMetadata,
@@ -23,6 +24,37 @@ from vllm.v1.attention.backends.flash_attn import (
 from .qwen3_dflash import DFlashQwen3DecoderLayer, Qwen3MLP
 from .qwen3_dspark import DSparkMarkovHead, Qwen3DSparkModel
 from .utils import WeightsMapper, get_draft_quant_config
+
+
+def _anchor_window_mla(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    window: int,
+) -> torch.Tensor:
+    # Profiling traces the backbone before KV pages are allocated. Resolve
+    # the current context inside the op on every execution of that graph.
+    if get_forward_context().attn_metadata is None:
+        return torch.zeros_like(query)
+    from .qwen3_dspark_swa import anchor_window_attention
+
+    metadata, _, cache, _ = get_attention_context(layer_name)
+    return anchor_window_attention(
+        query, key, value, cache, metadata, positions, window
+    )
+
+
+def _anchor_window_mla_fake(query, key, value, positions, layer_name, window):
+    return torch.empty_like(query)
+
+
+direct_register_custom_op(
+    op_name="dspark_anchor_window_mla",
+    op_func=_anchor_window_mla,
+    fake_impl=_anchor_window_mla_fake,
+)
 
 
 class Qwen3DSparkMLA(nn.Module):
@@ -124,16 +156,9 @@ class Qwen3DSparkMLA(nn.Module):
         query = self.project_query(positions, hidden_states)
         key, value = self.project_kv(positions, hidden_states)
         if self.context_window is not None:
-            from .qwen3_dspark_swa import anchor_window_attention
-
-            if get_forward_context().attn_metadata is None:
-                # Memory profiling before the paged cache is allocated.
-                output = torch.zeros_like(query)
-            else:
-                metadata, _, cache, _ = get_attention_context(self.attn.layer_name)
-                output = anchor_window_attention(
-                    query, key, value, cache, metadata, positions, self.context_window
-                )
+            output = torch.ops.vllm.dspark_anchor_window_mla(
+                query, key, value, positions, self.attn.layer_name, self.context_window
+            )
             return self.o_proj(output.flatten(1))
         return self.o_proj(self.attn(query.flatten(1), key, value))
 
