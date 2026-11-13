@@ -47,7 +47,7 @@ def init_speculator(
             DSparkSpeculator,
         )
 
-        return DSparkSpeculator(vllm_config, device)
+        return DSparkSpeculator(vllm_config, device, req_states.all_token_ids.gpu)
     elif speculative_config.use_gemma4_mtp():
         from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
             Gemma4Speculator,

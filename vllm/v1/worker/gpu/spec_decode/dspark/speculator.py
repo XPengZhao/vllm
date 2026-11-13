@@ -30,6 +30,10 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.model_executor.models.qwen3_dspark_engram import (
+    DSparkEngramMemory,
+    engram_history,
+)
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -39,8 +43,11 @@ logger = init_logger(__name__)
 
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
+    engram: DSparkEngramMemory | None = None
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, all_token_ids: torch.Tensor
+    ):
         super().__init__(vllm_config, device)
 
         # Whether to sample from the anchor position. When True, uses anchor-as-first
@@ -79,6 +86,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_model_config.hf_config, "dspark_draft_topk", None
         )
 
+        self.all_token_ids = all_token_ids
         self.use_confidence_head: bool = False
 
     def load_draft_model(
@@ -87,6 +95,10 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        memory = getattr(
+            getattr(getattr(model, "model", None), "markov_head", None), "memory", None
+        )
+        self.engram = memory if isinstance(memory, DSparkEngramMemory) else None
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
@@ -176,11 +188,24 @@ class DSparkSpeculator(DFlashSpeculator):
         # read via the precomputed persistent index (fixed buffer for capture).
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
+        if self.engram is not None:
+            queries = self.engram.query_norm(self.engram.query(sample_hidden)).reshape(
+                num_reqs, n_spec, -1
+            )
+            older, previous = engram_history(
+                self.all_token_ids, idx_map[:, 0], sample_pos[:, 0] - 1
+            )
+
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
+            if self.engram is not None:
+                markov_embed = markov_embed + self.engram.correction(
+                    queries[:, i], older, previous, prev
+                )
+                older, previous = previous, prev.long()
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
             draft_sampled_i = self._sample_logits(
@@ -222,10 +247,23 @@ class DSparkSpeculator(DFlashSpeculator):
         confidence_markov_embeds = []
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
+        if self.engram is not None:
+            queries = self.engram.query_norm(self.engram.query(sample_hidden)).reshape(
+                num_reqs, n_spec, -1
+            )
+            older, previous = engram_history(
+                self.all_token_ids, idx_map[:, 0], sample_pos[:, 0] - 1
+            )
+
         for i in range(n_spec):
             markov_embed = self.model.markov_embed(prev)
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
+            if self.engram is not None:
+                markov_embed = markov_embed + self.engram.correction(
+                    queries[:, i], older, previous, prev
+                )
+                older, previous = previous, prev.long()
             logits_i = self.model.apply_markov_bias_gathered(
                 markov_embed,
                 base_logits[:, i],

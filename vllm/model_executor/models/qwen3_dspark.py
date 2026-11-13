@@ -226,6 +226,21 @@ class Qwen3DSparkModel(DFlashQwen3Model):
                 getattr(config, "dspark_draft_topk", None) is not None
             ),
         )
+        if str(getattr(config, "markov_head_type", "")).lower() == "engram":
+            from .qwen3_dspark_engram import DSparkEngramMemory
+
+            spec = vllm_config.speculative_config
+            assert spec is not None
+            if (
+                not getattr(config, "sample_from_anchor", True)
+                or spec.num_speculative_tokens != config.block_size
+            ):
+                raise ValueError(
+                    "Engram requires anchor sampling with the trained block size"
+                )
+            self.markov_head.memory = DSparkEngramMemory(
+                config, dspark_config["engram"]
+            )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", False):
             with_markov = getattr(config, "confidence_head_with_markov", False)
@@ -365,6 +380,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
                 "Reduced-vocabulary Qwen3 DSpark checkpoints must include a "
                 "d2t mapping so sampled draft ids can be converted to target ids."
             )
+
+        memory = getattr(self.model.markov_head, "memory", None)
+        if memory is not None:
+            memory.pack_weights(model_weights, "model.markov_head.memory.")
 
         orig_to_new_substr = {"mask_embedding": None}
         if not includes_embed_tokens:
