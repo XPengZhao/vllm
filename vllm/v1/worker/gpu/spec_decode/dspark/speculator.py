@@ -13,8 +13,8 @@ Differences from DFlash:
     token), so we sample at all N positions and ``sample_pos = query_pos + 1``
     (standard next-token), whereas DFlash's masks sit AT the predicted position.
     This is the ``sample_from_anchor`` path in the shared prepare-inputs kernel.
-    Speculators-format checkpoints instead use the DFlash ``1 + N`` fill-in
-    layout (anchor is the bonus token).
+    Checkpoints with ``sample_from_anchor=False`` use the DFlash ``1 + N``
+    layout. Only the N masks predict, starting with the anchor as Markov input.
   * Sequential Markov sampling: instead of DFlash's single parallel sample, we
     sample left-to-right, adding a prefix-dependent Markov bias derived from the
     previously sampled token at each step.

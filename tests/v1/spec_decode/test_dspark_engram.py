@@ -93,8 +93,9 @@ def test_engram_graph_reloads_history():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
 @pytest.mark.parametrize("topk", [None, 8])
+@pytest.mark.parametrize("sample_from_anchor", [True, False])
 @torch.inference_mode()
-def test_seven_step_graph_matches_eager_after_request_reuse(topk):
+def test_seven_step_graph_matches_eager_after_request_reuse(topk, sample_from_anchor):
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
     # Exercise the real sampling loop and Triton logits-cache scatter. A tiny
@@ -139,11 +140,12 @@ def test_seven_step_graph_matches_eager_after_request_reuse(topk):
     state.draft_logits = torch.zeros(4, n, vocab, dtype=dtype, device=dev)
     state.draft_token_confidence_probs = torch.zeros(b, n, device=dev)
     state.all_token_ids = torch.randint(vocab, (4, 32), device=dev, dtype=torch.int32)
+    query_width = n + int(not sample_from_anchor)
     state.input_buffers = SimpleNamespace(
-        input_ids=torch.zeros(b * n, device=dev, dtype=torch.int32)
+        input_ids=torch.zeros(b * query_width, device=dev, dtype=torch.int32)
     )
-    state._anchor_idx = torch.arange(b, device=dev) * n
-    h = torch.randn(b * n, hidden, device=dev, dtype=dtype)
+    state._anchor_idx = torch.arange(b, device=dev) * query_width
+    h = torch.randn(b * query_width, hidden, device=dev, dtype=dtype)
     # Same initial values as DFlashSpeculator.capture: no live samples.
     state.sample_indices = torch.zeros(b * n, device=dev, dtype=torch.long)
     state.sample_pos = torch.zeros_like(state.sample_indices)
@@ -163,7 +165,11 @@ def test_seven_step_graph_matches_eager_after_request_reuse(topk):
         ]
         state.sample_indices.copy_(
             torch.where(
-                live[:, None], torch.arange(b * n, device=dev).view(b, n), 0
+                live[:, None],
+                state._anchor_idx[:, None]
+                + int(not sample_from_anchor)
+                + state._step_cols,
+                0,
             ).flatten()
         )
         state.sample_idx_mapping.copy_(req[:, None].expand(-1, n).flatten())

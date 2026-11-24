@@ -2157,6 +2157,17 @@ def test_max_num_new_slots_for_drafting(method, parallel_drafting, expected_slot
     assert speculative_config.max_num_new_slots_for_drafting == expected_slots
 
 
+@pytest.mark.parametrize("sample_from_anchor,expected", [(True, 7), (False, 8)])
+def test_dspark_scheduler_budgets_all_query_positions(sample_from_anchor, expected):
+    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=7)
+    spec.method = "dspark"
+    spec.parallel_drafting = True
+    spec.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(sample_from_anchor=sample_from_anchor)
+    )
+    assert 1 + spec.max_num_new_slots_for_drafting == expected
+
+
 @dataclass
 class _TestConfigFields:
     a: int

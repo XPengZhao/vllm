@@ -1890,7 +1890,8 @@ class SpeculativeConfig:
         EAGLE3               eagle3        No       0
         P-EAGLE              eagle3        Yes      K - 1
         DFlash               dflash        Yes      K
-        DSpark               dspark        Yes      K - 1
+        DSpark (anchor)      dspark        Yes      K - 1
+        DSpark (mask)        dspark        Yes      K
         MTP                  mtp           No       0
         N-gram               ngram         No       0
         Draft model          draft_model   No       1
@@ -1899,8 +1900,15 @@ class SpeculativeConfig:
         """
         num_draft_tokens = self.num_speculative_tokens
 
-        if self.use_dflash():
-            # DFlash uses one bonus query followed by K mask queries.
+        if self.use_dflash() or (
+            self.use_dspark()
+            and not getattr(
+                getattr(self.draft_model_config, "hf_config", None),
+                "sample_from_anchor",
+                True,
+            )
+        ):
+            # One bonus query followed by K mask queries.
             return num_draft_tokens
 
         if self.parallel_drafting:

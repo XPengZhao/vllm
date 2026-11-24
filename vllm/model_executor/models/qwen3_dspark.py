@@ -231,13 +231,10 @@ class Qwen3DSparkModel(DFlashQwen3Model):
 
             spec = vllm_config.speculative_config
             assert spec is not None
-            if (
-                not getattr(config, "sample_from_anchor", True)
-                or spec.num_speculative_tokens != config.block_size
-            ):
-                raise ValueError(
-                    "Engram requires anchor sampling with the trained block size"
-                )
+            if not isinstance(getattr(config, "sample_from_anchor", True), bool):
+                raise ValueError("sample_from_anchor must be a boolean")
+            if spec.num_speculative_tokens != config.block_size:
+                raise ValueError("Engram requires the trained block size")
             self.markov_head.memory = DSparkEngramMemory(
                 config, dspark_config["engram"]
             )
