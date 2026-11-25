@@ -13,6 +13,9 @@ class DSparkEngramMemory(nn.Module):
         super().__init__()
         if options["hash_version"] != "xor_v1":
             raise ValueError("Unsupported Markov Engram hash version")
+        self.vector_gate = options.get("vector_gate", False)
+        if type(self.vector_gate) is not bool:
+            raise ValueError("Engram vector_gate must be a boolean")
         self.heads = options.get("heads_per_order", 2)
         self.counts = tuple(options["bucket_counts"])
         self.multipliers = tuple(options["hash_multipliers"])
@@ -43,6 +46,21 @@ class DSparkEngramMemory(nn.Module):
         self.query_norm = nn.RMSNorm(width, eps=config.rms_norm_eps)
         self.key_norm = nn.RMSNorm(width, eps=config.rms_norm_eps)
         self.scale = width**-0.5
+        if self.vector_gate:
+            self.vector_gate_norm = nn.RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.vector_gate_proj = nn.Linear(config.hidden_size, config.markov_rank)
+
+    def modulation(self, hidden_states):
+        if not self.vector_gate:
+            return None
+        return (
+            2.0
+            * self.vector_gate_proj(self.vector_gate_norm(hidden_states))
+            .float()
+            .sigmoid()
+        )
 
     def pack_weights(self, weights, prefix):
         rows = []
@@ -53,11 +71,13 @@ class DSparkEngramMemory(nn.Module):
                 raise ValueError(f"Missing or incompatible Engram table: {name}")
             rows.append(row)
         weights[prefix + "table.weight"] = torch.cat(rows)
-        for name, _ in self.named_parameters():
+        for name, parameter in self.named_parameters():
             if prefix + name not in weights:
                 raise ValueError(f"Missing Engram weight: {prefix}{name}")
+            if weights[prefix + name].shape != parameter.shape:
+                raise ValueError(f"Incompatible Engram weight: {prefix}{name}")
 
-    def correction(self, query, older, previous, current):
+    def correction(self, query, older, previous, current, modulation=None):
         m0, m1, m2 = self.multipliers
         bigram = current.long() * m0 ^ (previous * m1)
         trigram = bigram ^ (older * m2)
@@ -74,7 +94,11 @@ class DSparkEngramMemory(nn.Module):
             (query.float() * key.float()).sum(-1, keepdim=True) * self.scale
         ).sigmoid()
         value = self.value(memory)
-        return value * gate.to(value.dtype)
+        if self.vector_gate:
+            if modulation is None:
+                raise ValueError("Vector-gated Engram requires hidden-state modulation")
+            value = modulation.to(value.dtype) * value
+        return gate.to(value.dtype) * value
 
 
 def engram_history(all_token_ids, request_rows, anchor_positions):

@@ -192,6 +192,9 @@ class DSparkSpeculator(DFlashSpeculator):
             queries = self.engram.query_norm(self.engram.query(sample_hidden)).reshape(
                 num_reqs, n_spec, -1
             )
+            modulation = self.engram.modulation(sample_hidden)
+            if modulation is not None:
+                modulation = modulation.reshape(num_reqs, n_spec, -1)
             older, previous = engram_history(
                 self.all_token_ids, idx_map[:, 0], sample_pos[:, 0] - 1
             )
@@ -203,7 +206,11 @@ class DSparkSpeculator(DFlashSpeculator):
                 confidence_markov_embeds.append(markov_embed)
             if self.engram is not None:
                 markov_embed = markov_embed + self.engram.correction(
-                    queries[:, i], older, previous, prev
+                    queries[:, i],
+                    older,
+                    previous,
+                    prev,
+                    None if modulation is None else modulation[:, i],
                 )
                 older, previous = previous, prev.long()
             bias = self.model.markov_bias(markov_embed)
@@ -251,6 +258,9 @@ class DSparkSpeculator(DFlashSpeculator):
             queries = self.engram.query_norm(self.engram.query(sample_hidden)).reshape(
                 num_reqs, n_spec, -1
             )
+            modulation = self.engram.modulation(sample_hidden)
+            if modulation is not None:
+                modulation = modulation.reshape(num_reqs, n_spec, -1)
             older, previous = engram_history(
                 self.all_token_ids, idx_map[:, 0], sample_pos[:, 0] - 1
             )
@@ -261,7 +271,11 @@ class DSparkSpeculator(DFlashSpeculator):
                 confidence_markov_embeds.append(markov_embed)
             if self.engram is not None:
                 markov_embed = markov_embed + self.engram.correction(
-                    queries[:, i], older, previous, prev
+                    queries[:, i],
+                    older,
+                    previous,
+                    prev,
+                    None if modulation is None else modulation[:, i],
                 )
                 older, previous = previous, prev.long()
             logits_i = self.model.apply_markov_bias_gathered(

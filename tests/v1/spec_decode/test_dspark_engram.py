@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -94,8 +95,11 @@ def test_engram_graph_reloads_history():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
 @pytest.mark.parametrize("topk", [None, 8])
 @pytest.mark.parametrize("sample_from_anchor", [True, False])
+@pytest.mark.parametrize("vector_gate", [False, True])
 @torch.inference_mode()
-def test_seven_step_graph_matches_eager_after_request_reuse(topk, sample_from_anchor):
+def test_seven_step_graph_matches_eager_after_request_reuse(
+    topk, sample_from_anchor, vector_gate
+):
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
     # Exercise the real sampling loop and Triton logits-cache scatter. A tiny
@@ -110,6 +114,7 @@ def test_seven_step_graph_matches_eager_after_request_reuse(topk, sample_from_an
             bucket_counts=[31, 37, 41, 43],
             hash_multipliers=[73856093, 19349663, 83492791],
             head_dim=4,
+            vector_gate=vector_gate,
         ),
     ).to(device=dev, dtype=dtype)
     lm, w2 = [
@@ -200,3 +205,58 @@ def test_seven_step_graph_matches_eager_after_request_reuse(topk, sample_from_an
         assert torch.all((actual[0][req[live]] != 111).any(dim=-1))
         unused = sorted(set(range(4)) - set(rows))
         assert torch.all(actual[0][unused] == 111)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vector_gate_matches_training_formula_and_loads_weights(dtype):
+    """The context gate modulates value before scalar gating, in training dtype."""
+    options: dict[str, Any] = dict(
+        hash_version="xor_v1",
+        bucket_counts=[31, 37, 41, 43],
+        hash_multipliers=[11, 13, 17],
+        head_dim=2,
+        vector_gate=True,
+    )
+    config = SimpleNamespace(hidden_size=9, markov_rank=4, rms_norm_eps=1e-6)
+    memory = DSparkEngramMemory(config, options).to(dtype)
+    h = torch.randn(3, 9).to(dtype)
+    older = torch.tensor([1, -1, -1])
+    previous = torch.tensor([2, 2, -1])
+    current = torch.tensor([3, 3, 3])
+    chunks = []
+    offset = 0
+    for i, count in enumerate(options["bucket_counts"]):
+        mixed = (current * 11) ^ (previous * 13)
+        valid = previous >= 0
+        if i >= 2:
+            mixed = mixed ^ (older * 17)
+            valid = valid & (older >= 0)
+        chunks.append(
+            memory.table.weight[offset + mixed.remainder(count)] * valid[:, None]
+        )
+        offset += count
+    m = torch.cat(chunks, dim=-1)
+    q = memory.query_norm(memory.query(h))
+    k = memory.key_norm(memory.key(m))
+    scalar = ((q.float() * k.float()).sum(-1, keepdim=True) * memory.scale).sigmoid()
+    r = 2 * memory.vector_gate_proj(memory.vector_gate_norm(h)).float().sigmoid()
+    v = memory.value(m)
+    expected = scalar.to(dtype) * (r.to(dtype) * v)
+    torch.testing.assert_close(
+        memory.correction(q, older, previous, current, memory.modulation(h)),
+        expected,
+        atol=0,
+        rtol=0,
+    )
+    weights = dict(memory.state_dict())
+    table = weights.pop("table.weight")
+    for i, part in enumerate(table.split(options["bucket_counts"])):
+        weights[f"tables.{i}.weight"] = part
+    broken = dict(weights)
+    broken.pop("vector_gate_proj.bias")
+    with pytest.raises(ValueError, match="vector_gate_proj.bias"):
+        memory.pack_weights(broken, "")
+    memory.pack_weights(weights, "")
+    restored = DSparkEngramMemory(config, options).to(dtype)
+    restored.load_state_dict(weights)
+    torch.testing.assert_close(restored.modulation(h), r, atol=0, rtol=0)
