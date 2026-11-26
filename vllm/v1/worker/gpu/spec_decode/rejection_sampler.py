@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -153,6 +154,13 @@ class RejectionSampler:
         *,
         watermark_key: int | None = None,
     ):
+        self.ngram_trace = None
+        if os.environ.get("VLLM_NGRAM_TRACE_DIR"):
+            if watermark_key is not None:
+                raise ValueError("Ngram trace does not support watermarking")
+            from vllm.v1.worker.gpu.spec_decode.ngram_trace import NgramTrace
+
+            self.ngram_trace = NgramTrace(sampler, spec_config)
         self.sampler = sampler
         self.watermark_key = watermark_key
         if watermark_key is not None:
@@ -349,6 +357,18 @@ class RejectionSampler:
                 input_batch.seq_lens_cpu_upper_bound.numpy()[start:end],
                 verify_draft_sampled[lo:hi],
             )
+            if self.ngram_trace is not None:
+                self.ngram_trace.record(
+                    input_batch,
+                    start,
+                    end,
+                    logits[lo:hi],
+                    processed_logits,
+                    draft_sampled[lo:hi],
+                    pos[lo:hi],
+                    num_sampled,
+                    chunk_cu_num_logits_np,
+                )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
                 num_sampled,
@@ -429,6 +449,10 @@ class RejectionSampler:
         # verification sees the copy: `apply_sampling_params` and watermarking
         # keep the real draft ids.
         verify_draft_sampled = draft_sampled
+        if invalid_drafts is not None and self.ngram_trace is not None:
+            raise ValueError(
+                "Ngram trace does not support grammar-constrained decoding"
+            )
         if invalid_drafts is not None:
             verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)
 

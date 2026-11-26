@@ -70,6 +70,10 @@ class RejectionSampler(nn.Module):
         spec_config: SpeculativeConfig | None = None,
         device: torch.device | None = None,
     ):
+        import os
+
+        if os.environ.get("VLLM_NGRAM_TRACE_DIR"):
+            raise ValueError("Ngram trace requires VLLM_USE_V2_MODEL_RUNNER=1")
         super().__init__()
         self.sampler = sampler
         self.use_fp64_gumbel = getattr(sampler, "use_fp64_gumbel", False)

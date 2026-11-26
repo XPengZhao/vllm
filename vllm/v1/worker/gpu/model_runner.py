@@ -1629,6 +1629,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
             assert self.speculator is not None
+            if self.rejection_sampler.ngram_trace is not None:
+                self.rejection_sampler.ngram_trace.set_draft_buffers(self.speculator)
             sampler_output = self.rejection_sampler(
                 logits,
                 input_batch,

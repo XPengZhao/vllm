@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+import os
 from typing import Any
 
 import torch
@@ -86,6 +87,32 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_model_config.hf_config, "dspark_draft_topk", None
         )
 
+        self.ngram_trace_logits = self.ngram_trace_stamps = None
+        self.ngram_trace_off_logits = self.ngram_trace_off_stamps = None
+        paired_trace = os.environ.get("VLLM_NGRAM_TRACE_PAIRED", "0")
+        if paired_trace not in ("0", "1"):
+            raise ValueError("VLLM_NGRAM_TRACE_PAIRED must be 0 or 1")
+        if paired_trace == "1" and not os.environ.get("VLLM_NGRAM_TRACE_DIR"):
+            raise ValueError("Paired trace requires VLLM_NGRAM_TRACE_DIR")
+        if os.environ.get("VLLM_NGRAM_TRACE_DIR"):
+            self.ngram_trace_logits = torch.empty(
+                (self.max_num_reqs, self.num_speculative_steps, self.vocab_size),
+                dtype=self.draft_logits_spec(vllm_config)[0],
+                device=device,
+            )
+            self.ngram_trace_stamps = torch.full(
+                (self.max_num_reqs, self.num_speculative_steps),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
+
+            if paired_trace == "1":
+                self.ngram_trace_off_logits = torch.empty_like(self.ngram_trace_logits)
+                self.ngram_trace_off_stamps = torch.full_like(
+                    self.ngram_trace_stamps, -1
+                )
+
         self.all_token_ids = all_token_ids
         self.use_confidence_head: bool = False
 
@@ -99,9 +126,17 @@ class DSparkSpeculator(DFlashSpeculator):
             getattr(getattr(model, "model", None), "markov_head", None), "memory", None
         )
         self.engram = memory if isinstance(memory, DSparkEngramMemory) else None
+        if self.ngram_trace_off_logits is not None and self.engram is None:
+            raise ValueError("Paired ngram trace requires an Engram draft model")
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
+        if self.ngram_trace_logits is not None and (
+            model.draft_id_to_target_id is not None or self._draft_topk is not None
+        ):
+            raise ValueError(
+                "Ngram trace requires full-vocabulary DSpark without draft_topk"
+            )
         if self.draft_logits is not None and model.draft_id_to_target_id is not None:
             d2t = model.draft_id_to_target_id
             self._d2t_scatter_index = (
@@ -132,6 +167,21 @@ class DSparkSpeculator(DFlashSpeculator):
         sample_pos: torch.Tensor,
         step: int,
     ) -> torch.Tensor:
+        if self.ngram_trace_logits is not None:
+            if logits.shape[-1] != self.ngram_trace_logits.shape[-1]:
+                raise ValueError("Ngram trace vocabulary width mismatch")
+            from vllm.v1.worker.gpu.spec_decode.ngram_trace_cache import (
+                cache_trace_logits,
+            )
+
+            cache_trace_logits(
+                logits,
+                idx_map,
+                sample_pos,
+                self.ngram_trace_logits,
+                self.ngram_trace_stamps,
+                step,
+            )
         self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
         if self.draft_logits is None:
             draft_ids = logits.argmax(dim=-1)
@@ -202,6 +252,21 @@ class DSparkSpeculator(DFlashSpeculator):
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
+            if self.ngram_trace_off_logits is not None:
+                from vllm.v1.worker.gpu.spec_decode.ngram_trace_cache import (
+                    cache_trace_logits,
+                )
+
+                # Same on-trajectory history, original Markov path, no extra draw.
+                off_logits = base_logits[:, i] + self.model.markov_bias(markov_embed)
+                cache_trace_logits(
+                    off_logits,
+                    idx_map[:, i],
+                    sample_pos[:, i],
+                    self.ngram_trace_off_logits,
+                    self.ngram_trace_off_stamps,
+                    i,
+                )
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
             if self.engram is not None:
